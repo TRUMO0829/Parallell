@@ -1,3 +1,16 @@
+//ThreadData бүтэц:
+    //arr          ← эх массив
+    //temp         ← түр зуурын массив
+    //n            ← нийт элементүүдийн тоо
+    //digit        ← одоогийн боловсруулж буй орон (0 = LSD)
+    //thread_id
+    //num_threads
+    //global_count ← хамтарсан тоолох массив
+    //mutex        ← synchronization
+//функц get_digit(num: unsigned int, digit_pos: int) → int
+  //  power ← 10^digit_pos          // pow(10, digit_pos)
+//  return (num / power) % 10
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -138,3 +151,61 @@ int main() {
     free(arr);
     return 0;
 }
+//Алгоритм: PARALLEL_LSD_RADIX_SORT_BASE10(arr, n, num_threads)
+
+  //  if n <= 1 then return
+
+    //temp ← шинэ массив (size = n)
+ //   max_digits ← 10                     // Unsigned 32-bit тоонд хамгийн их 10 орон
+
+   // for digit = 0 to max_digits-1       // LSD: бага оронгоос эхэлнэ
+     //   global_count[0..9] ← {0, 0, ..., 0}
+
+        // =============================================
+        // Phase 1: Parallel Counting (Тоолох фаз)
+        // =============================================
+        //for each thread t = 0 to num_threads-1 in parallel:
+            //start ← t * (n / num_threads)
+            //end   ← (t == num_threads-1) ? n : start + (n / num_threads)
+
+           // local_count[0..9] ← {0}
+
+            //for i = start to end-1:
+                //d ← get_digit(arr[i], digit)        // Base 10 digit авах
+               // local_count[d] ← local_count[d] + 1
+
+            // Local-оо global_count руу нэмэх (mutex-ээр хамгаална)
+            //lock(mutex)
+            //for i = 0 to 9:
+              ///  global_count[i] ← global_count[i] + local_count[i]
+            //unlock(mutex)
+
+        // =============================================
+        // Phase 2: Prefix Sum (Cumulative Count)
+        // =============================================
+        //for i = 1 to 9:
+           // global_count[i] ← global_count[i] + global_count[i-1]
+
+        // =============================================
+        // Phase 3: Parallel Permute / Scatter (Байрлуулах фаз)
+        // =============================================
+        //for each thread t = 0 to num_threads-1 in parallel:
+            //start ← t * (n / num_threads)
+            //end   ← (t == num_threads-1) ? n : start + (n / num_threads)
+
+            //for i = start to end-1:
+                //d ← get_digit(arr[i], digit)
+                //pos ← global_count[d] - 1           // decrement
+               // temp[pos] ← arr[i]
+                //global_count[d] ← pos               // шинэчлэх
+
+        // =============================================
+        // Swap arr and temp
+        // =============================================
+        //swap(arr, temp)
+
+    // Эцэст нь үр дүн arr-д байх ёстой
+   // if arr != temp then
+        //copy temp to arr
+
+    //free(temp)
