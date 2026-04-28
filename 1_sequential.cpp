@@ -22,6 +22,9 @@
 //   is the structure the std::thread and OpenMP variants will parallelize.
 // =============================================================================
 
+
+
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
