@@ -10,6 +10,9 @@
 //  Колаб дээр хөрвүүлж ажиллуулах:
 //    !nvcc -O3 -std=c++17 -o radix_cuda radix_cuda.cu
 //    !./radix_cuda
+//
+//  Гаралт: console дээр + results_cuda.csv файл (N = 10k / 100k / 1M
+//  хэмжээ бүрд нэг мөр).
 // =============================================================================
 
 #include <cstdio>
@@ -22,7 +25,7 @@
 #include <cuda_runtime.h>
 
 // ---- Тогтмолууд ------------------------------------------------------------
-#define BLOCKS   8                       // Бie даалт бүрд блокын тоо
+#define BLOCKS   8                       // Бие даалт бүрд блокын тоо
 #define THREADS  256                     // Блок дотор зангилааны тоо
 #define BINS     256                     // 8-битийн радикс => 256 бункет
 #define PASSES   4                       // 32 бит / 8 бит = 4 дамжлага
@@ -178,19 +181,88 @@ Timing run_radix_cuda(const uint32_t *host_in, uint32_t *host_out, int N, bool p
     return Timing{ ms_total, ms_kernel, ms_h2d, ms_d2h };
 }
 
+// =============================================================================
+// Benchmark driver — runs N = 10k, 100k, 1M and writes one CSV row per N.
+// CSV columns:
+//   implementation,N,execution_ms,computation_ms,transfer_ms,transfer_bytes,
+//   total_ops,performance_mops,sorted_ok
+//
+// Metric definitions (CUDA, base-256 LSD on uint32, 4 passes):
+//   execution_ms     = ms_total  (malloc + H2D + kernels + D2H + free)
+//   computation_ms   = ms_kernel (pure GPU kernel time)
+//   transfer_ms      = ms_h2d + ms_d2h
+//   transfer_bytes   = 2 * N * 4   (input H2D + output D2H, uint32_t)
+//   total_ops        = D * (5N + R)   D = PASSES = 4, R = BINS = 256
+//                      (count: 2N, prefix sum: R, scatter: 3N per pass)
+//   performance_mops = total_ops / (execution_ms * 1000)
+// =============================================================================
 int main()
 {
     int sizes[] = { 10000, 100000, 1000000 };
+
+    FILE* csv = fopen("results_cuda.csv", "w");
+    if (!csv) { fprintf(stderr, "ERROR: cannot open results_cuda.csv\n"); return 1; }
+    fprintf(csv, "implementation,N,execution_ms,computation_ms,transfer_ms,"
+                 "transfer_bytes,total_ops,performance_mops,sorted_ok\n");
+
+    printf("implementation = cuda (base-256 LSD, uint32, %d passes, %d blocks x %d threads)\n",
+           PASSES, BLOCKS, THREADS);
+    printf("------------------------------------------------------------\n");
+
     for (int s = 0; s < 3; s++) {
         int N = sizes[s];
         std::vector<uint32_t> input(N), output(N);
-        std::mt19937 rng(42);
+        std::mt19937 rng(12345);                                  // unified seed
         std::uniform_int_distribution<uint32_t> dist;
         for (int i = 0; i < N; i++) input[i] = dist(rng);
 
+        // independent reference copy on the host: catches both order violations
+        // AND element corruption (a buggy GPU scatter that leaves the output
+        // sorted but with duplicated/missing values).
+        std::vector<uint32_t> ref(input);
+        std::sort(ref.begin(), ref.end());
+
         Timing t = run_radix_cuda(input.data(), output.data(), N, false);
-        bool ok = std::is_sorted(output.begin(), output.end());
-        printf("N=%d: %s, Time: %.3f ms\n", N, ok ? "Sorted" : "Error", t.ms_total);
+        bool ok = std::is_sorted(output.begin(), output.end()) && (output == ref);
+
+        const double execution_ms   = t.ms_total;
+        const double computation_ms = t.ms_kernel;
+        const double transfer_ms    = t.ms_h2d + t.ms_d2h;
+        const uint64_t transfer_bytes = 2ull * (uint64_t)N * sizeof(uint32_t);
+
+        const int D_gpu = PASSES;
+        const int R_gpu = BINS;
+        const uint64_t total_ops =
+            (uint64_t)D_gpu * (5ull * (uint64_t)N + (uint64_t)R_gpu);
+        const double performance_mops =
+            execution_ms > 0.0
+                ? (double)total_ops / (execution_ms * 1000.0)
+                : 0.0;
+
+        printf("N=%d  Execution=%.3f ms  Computation=%.3f ms  Transfer=%.3f ms (H2D=%.3f D2H=%.3f)"
+               "  TransferBytes=%llu  Operations=%llu  Performance=%.3f MOPS  Sorted=%s\n",
+               N, execution_ms, computation_ms, transfer_ms,
+               t.ms_h2d, t.ms_d2h,
+               (unsigned long long)transfer_bytes,
+               (unsigned long long)total_ops,
+               performance_mops,
+               ok ? "true" : "false");
+
+        fprintf(csv, "cuda,%d,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%s\n",
+                N, execution_ms, computation_ms, transfer_ms,
+                (unsigned long long)transfer_bytes,
+                (unsigned long long)total_ops,
+                performance_mops,
+                ok ? "true" : "false");
+
+        if (!ok) {
+            fprintf(stderr, "ERROR: output not sorted for N=%d\n", N);
+            fclose(csv);
+            return 1;
+        }
     }
+
+    fclose(csv);
+    printf("Wrote results_cuda.csv\n");
     return 0;
 }

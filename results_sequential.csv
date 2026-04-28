@@ -1,0 +1,4 @@
+implementation,N,num_threads,execution_ms,computation_ms,transfer_ms,transfer_bytes,total_ops,performance_mops,sorted_ok
+sequential,10000,1,0.479958,0.479958,0,0,500100,1041.97,true
+sequential,100000,1,2.01729,2.01729,0,0,5000100,2478.62,true
+sequential,1000000,1,26.6515,26.6515,0,0,50000100,1876.07,true

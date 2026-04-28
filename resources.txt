@@ -1,0 +1,111 @@
+# Sources used across all three implementations
+
+Organized by which implementation each source contributed to. Sources marked **PRIMARY** were used directly in the code; the rest are background references included in earlier discussion for the project report.
+
+---
+
+## A. Algorithm references (used in all three: sequential, OpenMP, std::thread)
+
+1. **PRIMARY — Cormen, Leiserson, Rivest, Stein.** *Introduction to Algorithms*, 3rd Edition. MIT Press, 2009.
+   - §8.3 "Radix sort" — the `RADIX-SORT(A, d)` outer-loop pseudocode and stability proof.
+   - §8.2 "Counting sort" — the three-phase `COUNTING-SORT(A, B, k)` pseudocode (histogram → cumulative counts → distribute).
+   - Cross-verified against the lecture-notes reproduction at YCP CS360 (faculty.ycp.edu/~dbabcock/PastCourses/cs360/lectures/lecture09.html).
+
+2. **PRIMARY — Sedgewick, R. & Wayne, K.** *Algorithms*, 4th Edition. Addison-Wesley, 2011. §5.1 "String Sorts."
+   - Web companion: https://algs4.cs.princeton.edu/51radix/
+   - Source file used: `LSD.java` at https://algs4.cs.princeton.edu/51radix/LSD.java.html
+   - Contributed: four-block structure (frequency counts → cumulates → move data → swap), the `count[d+1]++` offset trick, and the pointer-swap optimization.
+
+3. **PRIMARY (cross-check) — GeeksforGeeks.** "C++ Program For Radix Sort." Last updated 23 July 2025.
+   - URL: https://www.geeksforgeeks.org/cpp/cpp-program-for-radix-sort/
+   - Contributed: confirmation of base-10 digit extraction `(arr[i] / pos) % 10` and outer-loop bound `k / pos > 0`.
+
+---
+
+## B. OpenMP version — additional references
+
+4. **PRIMARY — OpenMP Architecture Review Board.** *OpenMP API Specification, Version 5.2.* November 2021.
+   - URL: https://www.openmp.org/spec-html/5.2/openmp.html
+   - Used: `parallel for` work-sharing construct; array reduction syntax `reduction(+: array[:length])` (§2.21.5).
+
+5. **OpenMP Architecture Review Board.** *OpenMP API Examples, Version 5.2.1.* December 2022.
+   - URL: https://www.openmp.org/wp-content/uploads/openmp-examples-5.2.1.pdf
+   - Used: array-reduction patterns (companion document to specification).
+
+6. **PRIMARY — Wang, H.** "A faster OpenMP Radix Sort implementation." Personal blog, written as TA for UIUC CS484 Parallel Programming. 26 May 2014.
+   - URL: https://haichuanwang.wordpress.com/2014/05/26/a-faster-openmp-radix-sort-implementation/
+   - Argues for parallelizing all three phases (counting, prefix, data movement) and prefers LSD over MSD to avoid recursion overhead. Directly informed the "simple vs. full" strategy choice.
+
+---
+
+## C. `std::thread` version — additional references
+
+7. **PRIMARY — Williams, A.** *C++ Concurrency in Action*, 2nd Edition. Manning Publications, 2019.
+   - Chapters used: Ch. 2 (managing `std::thread`, RAII, join semantics), Ch. 4 (synchronization), Ch. 8 (designing concurrent code: data partitioning patterns), Ch. 9 (thread pools).
+
+8. **PRIMARY — cppreference.com.** API reference (community-maintained; standard reference for C++ developers).
+   - `<thread>`: https://en.cppreference.com/w/cpp/thread
+   - `<atomic>`: https://en.cppreference.com/w/cpp/atomic
+   - Used: `std::thread::join`, `std::thread::hardware_concurrency`.
+
+9. **Langr, D.** "CPP11sort: A parallel quicksort based on C++ threading." *Concurrency and Computation: Practice and Experience*, 2022.
+   - URL: https://onlinelibrary.wiley.com/doi/10.1002/cpe.6606
+   - Code: https://gitlab.com/daniel.langr/cpp11sort
+   - Peer-reviewed paper showing parallel sort built only from C++ standard threading primitives, with parallel speedup between 16.1× and 44.2× on a 56-core server. Cited as the canonical reference for this approach.
+
+10. **Baserinia.** `parallel-sort` — efficient C++ multi-threaded sorting using C++11 threads. GitHub repository.
+    - URL: https://github.com/baserinia/parallel-sort
+    - Used as a small readable reference for the partitioning pattern.
+
+11. **PRIMARY — OpenGenus IQ.** "Parallel Radix Sort handling positive & negative numbers in C++."
+    - URL: https://iq.opengenus.org/parallel-radix-sort/
+    - Explicitly walks through MSD parallel approach with OpenMP and LSD parallel approach with std::thread (and POSIX pthread).
+
+---
+
+## D. Background references (mentioned in initial source list, included for the report)
+
+12. **Satish, N., Kim, C., Chhugani, J., Nguyen, A. D., et al.** "Fast Sort on CPUs and GPUs: A Case for Bandwidth Oblivious SIMD Sort." Intel Corporation. *Proceedings of SIGMOD 2010*.
+    - The canonical paper on architecture-friendly parallel radix sort.
+
+13. **Mattson, T. (Intel Corporation).** OpenMP tutorial materials and lecture slides.
+    - Widely-used industry teaching reference for OpenMP patterns.
+
+14. **Sandhu, P. S. & Anand, P.** "Analysis of Parallel and Sequential Radix Sort for Graph Exploration using OpenMP and CUDA: A Review." 2016.
+    - URL: https://www.researchgate.net/publication/303665042
+    - Reports OpenMP roughly 10× faster than sequential and CUDA roughly 100× faster on their dataset. Useful baseline expectation for speedup numbers.
+
+15. **Kokot, M., Deorowicz, S. & Debudaj-Grabysz, A.** "Sorting Data on Ultra-Large Scale with RADULS: New Incarnation of Radix Sort." Silesian University of Technology, 2016.
+    - URL: https://arxiv.org/abs/1612.02557
+
+16. **Author(s) — arXiv preprint.** "Comparison of parallel sorting algorithms." 2015.
+    - URL: https://arxiv.org/abs/1511.03404
+    - Methodology reference for benchmarking (input distributions, key sizes).
+
+17. **Axtmann, M., Witt, S., Ferizovic, D. & Sanders, P.** `ips2ra` — In-place Parallel Super Scalar Radix Sort. GitHub repository.
+    - URL: https://github.com/ips4o/ips2ra
+    - Uses C++ threads by default; can switch to OpenMP via a CMake flag. State-of-the-art reference.
+
+18. **Thiel, S., Thiel, L. & Butler, G.** "ThielSort: Implementing the Diverting Fast Radix Algorithm." Concordia University, 2022.
+    - URL: https://arxiv.org/abs/2207.14334
+
+19. **Knuth, D. E.** *The Art of Computer Programming, Vol. 3: Sorting and Searching*, 2nd Edition. Addison-Wesley, 1998. §5.2.5.
+    - Historical and theoretical depth on distribution sorts.
+
+20. **Wikipedia.** "Radix sort."
+    - URL: https://en.wikipedia.org/wiki/Radix_sort
+    - Useful for the LSD vs. MSD distinction and stability properties; reference for terminology only, not for citation in academic work.
+
+---
+
+## Suggested citation order for the report
+
+If your report has a single bibliography section, order by reference type:
+
+- **Textbooks**: 1 (CLRS), 2 (Sedgewick & Wayne), 7 (Williams), 19 (Knuth)
+- **Specifications/Documentation**: 4 (OpenMP Spec), 5 (OpenMP Examples), 8 (cppreference)
+- **Peer-reviewed papers**: 9 (Langr/CPP11sort), 12 (Satish et al.), 14 (Sandhu & Anand), 15 (RADULS), 16, 18 (ThielSort)
+- **Online resources / blogs**: 3 (GeeksforGeeks), 6 (Wang), 11 (OpenGenus), 13 (Mattson), 20 (Wikipedia)
+- **Software repositories**: 10 (baserinia), 17 (ips2ra)
+
+Numbers 1, 2, 4, 6, 7, 8, 11 are the ones whose content actually shaped the code. The rest are appropriate to cite in your "Related Work" or "References" section but weren't direct inputs.

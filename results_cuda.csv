@@ -1,0 +1,4 @@
+implementation,N,execution_ms,computation_ms,transfer_ms,transfer_bytes,total_ops,performance_mops,sorted_ok
+cuda,10000,1.907168,1.550336,0.103808,80000,201024,105.404451,true
+cuda,100000,7.722880,7.276608,0.267904,800000,2001024,259.103343,true
+cuda,1000000,76.723938,73.958817,2.182016,8000000,20001024,260.688183,true
