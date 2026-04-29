@@ -16,34 +16,10 @@
 //
 // After 8 passes (even) the alternating buffers leave the result in buf_a.
 //
-// ============================================================================
-// BUILD
-// ============================================================================
-//
-//   ── Linux / WSL ──────────────────────────────────────────────────────────
-//   # CUDA 12.4+: auto-detect your GPU's SM (recommended)
-//   nvcc -O3 -std=c++17 -arch=native -o gpu_radix_sort gpu_radix_sort_pc.cu
-//
+
 //   # RTX 5080 / Blackwell (sm_120), explicit target:
 //   nvcc -O3 -std=c++17 -arch=sm_120 -o gpu_radix_sort gpu_radix_sort_pc.cu
-//
-//   # RTX 4090 / Ada Lovelace (sm_89):
-//   nvcc -O3 -std=c++17 -arch=sm_89  -o gpu_radix_sort gpu_radix_sort_pc.cu
-//
-//   # RTX 3090 / Ampere (sm_86):
-//   nvcc -O3 -std=c++17 -arch=sm_86  -o gpu_radix_sort gpu_radix_sort_pc.cu
-//
-//   ── Windows (Developer Command Prompt / PowerShell) ───────────────────────
-//   nvcc -O3 -std=c++17 -arch=native -o gpu_radix_sort.exe gpu_radix_sort_pc.cu
-//
-//   ── Don't know your SM? ───────────────────────────────────────────────────
-//   nvidia-smi --query-gpu=compute_cap --format=csv,noheader
-//   # Then use  -arch=sm_<major><minor>  (e.g. 12.0 → -arch=sm_120)
-//
-// ============================================================================
-// RUN
-// ============================================================================
-//
+
 //   ./gpu_radix_sort                   # full benchmark sweep (N = 10k…10M)
 //   ./gpu_radix_sort 1000000           # single N
 //   ./gpu_radix_sort 1000000 42 20     # N, seed, timed-runs
@@ -358,7 +334,7 @@ int main(int argc, char** argv)
         sizes = {single_n};
     } else {
         // Full sweep
-        sizes = {10000, 100000, 1000000, 5000000, 10000000};
+        sizes = {10000, 100000, 1'000'000, 10'000'000};
     }
 
     // CSV header
