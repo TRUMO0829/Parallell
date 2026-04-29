@@ -1,35 +1,5 @@
-// =============================================================================
-// 3_openmp.cpp
-//
-// OpenMP parallel version of the LSD radix sort from radix_sort_sequential.cpp.
-//
-// Strategy: SIMPLE.
-//   - Phase (1) histogram     — PARALLEL via OpenMP array reduction
-//   - Phase (2) prefix sum    — serial (only R = 10 entries; not worth it)
-//   - Phase (3) distribute    — serial (parallelizing it requires per-thread
-//                               offsets; deferred to keep the code readable)
-//
-// Strong-scaling study: thread count is varied across {1, 2, 4, 8, 16} via
-// omp_set_num_threads, and the same N = {10k, 100k, 1M} sweep is run for
-// each thread count. Output CSV has one row per (num_threads, N) pair
-// (15 rows total). Same RNG seed 12345 and per-N driver structure as the
-// sequential and stdthread versions so timings are directly comparable.
-//
-// References:
-//   - CLRS, 3rd ed., §8.3 — radix sort outer loop & stability requirement
-//   - Sedgewick & Wayne, Algorithms 4e, §5.1 LSD.java — three-phase shape
-//   - OpenMP API Specification 5.2 (https://www.openmp.org/spec-html/5.2/openmp.html)
-//       * `parallel for` work-sharing construct
-//       * `reduction(+: array[:length])` array reduction (OpenMP 4.5+)
-//   - OpenMP API Examples 5.2.1 — array-reduction patterns
-//   - Haichuan Wang, "A faster OpenMP Radix Sort implementation" (UIUC CS484)
-//     https://haichuanwang.wordpress.com/2014/05/26/...
-//     — recommends parallelizing all three phases for best speedup; we only
-//        do phase (1) here as the chosen "simple" baseline.
-//
-// Build: clang++ -std=c++17 -O2 -pthread -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/libomp/lib -lomp -o radix_sort_omp 3_openmp.cpp
-// Run:     ./radix_sort_omp
-// =============================================================================
+// clang++ -std=c++17 -O2 -pthread -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/libomp/lib -lomp -o 3_openmp 3_openmp.cpp
+// ./3_openmp
 
 #include <algorithm>
 #include <cassert>
@@ -41,85 +11,47 @@
 #include <random>
 #include <vector>
 
-#include <omp.h>   // OpenMP runtime API (omp_set_num_threads, etc.)
+#include <omp.h> 
 
-// Stable counting sort on the decimal digit at place value `exp` (1, 10, 100, …).
-// Identical to the sequential version EXCEPT phase (1) is parallelized.
+static constexpr int NUM_BUCKETS = 1 << 8;   // 256 buckets (8-bit radix)
+
 static void counting_sort_by_digit(std::vector<uint32_t>& a,
                                    std::vector<uint32_t>& aux,
-                                   uint64_t exp) {
-    constexpr int R = 10;          // base 10
-    int count[R + 1] = {0};        // same offset trick as Sedgewick: count[d+1]
+                                   uint32_t shift) {
+    int count[NUM_BUCKETS + 1] = {0};
     const std::size_t n = a.size();
 
-    // ---- (1) histogram  — PARALLEL ---------------------------------------
-    // OpenMP gives each thread its own private copy of count[0..R], runs the
-    // loop in parallel, and after the parallel region sums all the private
-    // copies into the shared `count`. No race conditions, no atomics.
-    //
-    // The array-reduction syntax `count[:R+1]` (OpenMP 4.5+) is documented in
-    // the OpenMP API Specification §2.21.5 and is the idiomatic way to do a
-    // parallel histogram.
-    #pragma omp parallel for reduction(+:count[:R+1])
+    #pragma omp parallel for reduction(+:count[:NUM_BUCKETS+1])
     for (std::size_t i = 0; i < n; ++i) {
-        int d = static_cast<int>((a[i] / exp) % R);
+        int d = static_cast<int>((a[i] >> shift) & 0xFFu);
         count[d + 1]++;
     }
 
-    // ---- (2) prefix sum — SERIAL -----------------------------------------
-    // Only R = 10 elements; parallelizing this would cost more in overhead
-    // than it saves. The CLRS Ch. 8.2 "cumulative counts" step.
-    for (int r = 0; r < R; ++r) {
+    for (int r = 0; r < NUM_BUCKETS; ++r) {
         count[r + 1] += count[r];
     }
 
-    // ---- (3) distribute — SERIAL -----------------------------------------
-    // Parallelizing this safely requires per-thread, per-bucket write offsets
-    // (Wang, 2014). Kept serial here per the chosen "simple" strategy.
     for (std::size_t i = 0; i < n; ++i) {
-        int d = static_cast<int>((a[i] / exp) % R);
+        int d = static_cast<int>((a[i] >> shift) & 0xFFu);
         aux[count[d]++] = a[i];
     }
 
-    a.swap(aux);   // Sedgewick's pointer-swap optimization
+    a.swap(aux);
 }
 
-// LSD radix sort, base 10, for unsigned 32-bit integers.
-// Outer loop is identical to the sequential version (CLRS RADIX-SORT).
 void radix_sort_lsd(std::vector<uint32_t>& a) {
     if (a.size() < 2) return;
 
-    const uint32_t max_val = *std::max_element(a.begin(), a.end());
-
     std::vector<uint32_t> aux(a.size());
 
-    for (uint64_t exp = 1; max_val / exp > 0; exp *= 10) {
-        counting_sort_by_digit(a, aux, exp);
+    // uint32_t = 4 bytes => exactly 4 LSD passes (shift = 0, 8, 16, 24).
+    for (uint32_t shift = 0; shift < 32; shift += 8) {
+        counting_sort_by_digit(a, aux, shift);
     }
 }
 
-// =============================================================================
-// Benchmark driver — strong-scaling sweep.
-//   Outer loop: thread count T in {1, 2, 4, 8, 16}  (via omp_set_num_threads)
-//   Inner loop: N in {10k, 100k, 1M}
-//   => 5 × 3 = 15 CSV rows.
-//
-// CSV columns:
-//   implementation,N,num_threads,execution_ms,computation_ms,transfer_ms,
-//   transfer_bytes,total_ops,performance_mops,sorted_ok
-//
-// Metric definitions (OpenMP, base-10 LSD on uint32):
-//   execution_ms     = wall-clock around radix_sort_lsd
-//   computation_ms   = same as execution_ms
-//   transfer_ms      = 0
-//   transfer_bytes   = 0
-//   total_ops        = D * (5N + R)
-//   performance_mops = total_ops / (execution_ms * 1000)
-// =============================================================================
 int main() {
     using clock = std::chrono::steady_clock;
-
-    constexpr int R = 10;
 
     const char* CSV_PATH = "results_openmp.csv";
     const std::size_t sizes[]         = { 10'000, 100'000, 1'000'000 };
@@ -129,7 +61,7 @@ int main() {
     csv << "implementation,N,num_threads,execution_ms,computation_ms,transfer_ms,"
            "transfer_bytes,total_ops,performance_mops,sorted_ok\n";
 
-    std::cout << "implementation = openmp (base-10 LSD, uint32, strong-scaling sweep)\n";
+    std::cout << "implementation = openmp (base-256 LSD, uint32, 4 passes, strong-scaling sweep)\n";
     std::cout << "------------------------------------------------------------\n";
 
     for (int num_threads : thread_counts) {
@@ -137,18 +69,20 @@ int main() {
         std::cout << "\n=== num_threads = " << num_threads << " ===\n";
 
         for (std::size_t N : sizes) {
-            // ---- generate random test data (same seed as the other versions) ---
             std::vector<uint32_t> data(N);
             std::mt19937 rng(12345);
             std::uniform_int_distribution<uint32_t> dist(
                 0, std::numeric_limits<uint32_t>::max());
             for (std::size_t i = 0; i < N; ++i) data[i] = dist(rng);
 
-            // independent reference copy: catches both order violations AND
-            // element corruption from a buggy parallel scatter.
             std::vector<uint32_t> ref = data;
 
-            // ---- time the parallel radix sort ---------------------------------
+            // warm-up: run once, discard (creates OpenMP thread pool, warms cache)
+            {
+                std::vector<uint32_t> warmup = data;
+                radix_sort_lsd(warmup);
+            }
+
             auto t1 = clock::now();
             radix_sort_lsd(data);
             auto t2 = clock::now();
@@ -157,17 +91,14 @@ int main() {
             double transfer_ms    = 0.0;
             std::uint64_t transfer_bytes = 0;
 
-            std::sort(ref.begin(), ref.end());        // reference oracle
+            std::sort(ref.begin(), ref.end());     // reference oracle
 
-            // ---- digit count D for the actual max value -----------------------
-            const uint32_t max_val = ref.back();
-            int D = 0;
-            for (uint64_t exp = 1; max_val / exp > 0; exp *= R) ++D;
-            if (D == 0) D = 1;
+            // uint32_t always needs exactly 4 byte-passes; no max_val scan needed.
+            constexpr int D = 4;
 
             const std::uint64_t total_ops =
                 static_cast<std::uint64_t>(D) *
-                (5ull * static_cast<std::uint64_t>(N) + static_cast<std::uint64_t>(R));
+                (5ull * static_cast<std::uint64_t>(N) + static_cast<std::uint64_t>(NUM_BUCKETS));
             const double performance_mops =
                 execution_ms > 0.0
                     ? static_cast<double>(total_ops) / (execution_ms * 1000.0)

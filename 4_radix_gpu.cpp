@@ -1,19 +1,6 @@
 %%writefile radix_cuda.cu
-// Cuda radix sort
-// =============================================================================
-//  radix_cuda.cu  --- LSD Radix Sort на GPU
-//  Алгоритм: Harada & Howes (2011) "Introduction to GPU Radix Sort"
-//             3-алхамт схем (count -> scan -> reorder), 8-битийн радикс,
-//             32-битийн uint32_t-д 4 дамжлага.
-//
-//
-//  Колаб дээр хөрвүүлж ажиллуулах:
 //    !nvcc -O3 -std=c++17 -o radix_cuda radix_cuda.cu
 //    !./radix_cuda
-//
-//  Гаралт: console дээр + results_cuda.csv файл (N = 10k / 100k / 1M
-//  хэмжээ бүрд нэг мөр).
-// =============================================================================
 
 #include <cstdio>
 #include <cstdlib>
@@ -24,16 +11,12 @@
 #include <algorithm>
 #include <cuda_runtime.h>
 
-// ---- Тогтмолууд ------------------------------------------------------------
-#define BLOCKS   8                       // Бие даалт бүрд блокын тоо
-#define THREADS  256                     // Блок дотор зангилааны тоо
-#define BINS     256                     // 8-битийн радикс => 256 бункет
-#define PASSES   4                       // 32 бит / 8 бит = 4 дамжлага
-#define SCAN_N   (BLOCKS * BINS)         // = 2048 (1 блокын Blelloch-д багтана)
+#define BLOCKS   8                       
+#define THREADS  256                     
+#define BINS     256                     
+#define PASSES   4                       
+#define SCAN_N   (BLOCKS * BINS)         
 
-// =============================================================================
-//  KERNEL 1: count_kernel
-// =============================================================================
 __global__ void count_kernel(const uint32_t *in,
                              uint32_t *block_hist,
                              int n, uint32_t shift)
@@ -61,9 +44,7 @@ __global__ void count_kernel(const uint32_t *in,
     }
 }
 
-// =============================================================================
 //  KERNEL 2 & 3: Blelloch
-// =============================================================================
 __global__ void upsweep_kernel(uint32_t *data, int stride)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -85,9 +66,7 @@ __global__ void downsweep_kernel(uint32_t *data, int stride)
     }
 }
 
-// =============================================================================
 //  KERNEL 4: reorder_kernel
-// =============================================================================
 __global__ void reorder_kernel(const uint32_t *in,
                                uint32_t *out,
                                uint32_t *off,
@@ -181,21 +160,6 @@ Timing run_radix_cuda(const uint32_t *host_in, uint32_t *host_out, int N, bool p
     return Timing{ ms_total, ms_kernel, ms_h2d, ms_d2h };
 }
 
-// =============================================================================
-// Benchmark driver — runs N = 10k, 100k, 1M and writes one CSV row per N.
-// CSV columns:
-//   implementation,N,execution_ms,computation_ms,transfer_ms,transfer_bytes,
-//   total_ops,performance_mops,sorted_ok
-//
-// Metric definitions (CUDA, base-256 LSD on uint32, 4 passes):
-//   execution_ms     = ms_total  (malloc + H2D + kernels + D2H + free)
-//   computation_ms   = ms_kernel (pure GPU kernel time)
-//   transfer_ms      = ms_h2d + ms_d2h
-//   transfer_bytes   = 2 * N * 4   (input H2D + output D2H, uint32_t)
-//   total_ops        = D * (5N + R)   D = PASSES = 4, R = BINS = 256
-//                      (count: 2N, prefix sum: R, scatter: 3N per pass)
-//   performance_mops = total_ops / (execution_ms * 1000)
-// =============================================================================
 int main()
 {
     int sizes[] = { 10000, 100000, 1000000 };
@@ -216,9 +180,6 @@ int main()
         std::uniform_int_distribution<uint32_t> dist;
         for (int i = 0; i < N; i++) input[i] = dist(rng);
 
-        // independent reference copy on the host: catches both order violations
-        // AND element corruption (a buggy GPU scatter that leaves the output
-        // sorted but with duplicated/missing values).
         std::vector<uint32_t> ref(input);
         std::sort(ref.begin(), ref.end());
 
