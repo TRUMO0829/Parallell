@@ -1,6 +1,7 @@
 // clang++ -std=c++17 -O2 -pthread -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/libomp/lib -lomp -o 3_openmp 3_openmp.cpp
 // ./3_openmp
 
+// g++ -std=c++17 -O2 -pthread -fopenmp -o 3_openmp 3_openmp.cpp
 #include <algorithm>
 #include <cassert>
 #include <chrono>
