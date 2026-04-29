@@ -1,0 +1,4 @@
+elements,avg_time_ms,throughput_meps,correct
+10000,0.0404,247.6780,true
+100000,0.4264,234.5122,true
+1000000,4.4928,222.5767,true

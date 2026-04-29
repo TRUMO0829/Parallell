@@ -1,19 +1,20 @@
 """
-plot_all.py — generate every chart used in the report from the 4 result CSVs.
+plot_all.py — generate SpeedUp graphs from the result CSVs.
 
 Inputs (read from <project root>):
-    results_sequential.csv
-    results_stdthread.csv
-    results_openmp.csv
-    results_cuda.csv
+    radix_sort_stats.csv             (1_sequential.cpp -> sequential baseline)
+    radix_sort_pthread_stats.csv     (2_pthread.cpp)
+                                     NOTE: 2_pthread.cpp writes to a hardcoded
+                                     Colab path. If running locally, copy the
+                                     CSV into <project root> first, or change
+                                     the path in 2_pthread.cpp.
+    radix_sort_omp_stats.csv         (3_openmp.cpp)
+    results_cuda.csv                 (4_radix_gpu.cpp — old schema, unchanged)
 
 Outputs (saved into <project root>/stats/):
-    scaling_stdthread.png       SpeedUp vs num_threads, line per N (std::thread)
-    scaling_openmp.png          SpeedUp vs num_threads, line per N (OpenMP)
-    speedup_gpu.png             CUDA end-to-end vs kernel-only SpeedUp (bar)
-    exec_time_comparison.png    Execution time vs N, all 4 implementations
-    performance_mops.png        Achievable performance (MOPS), grouped by N
-    cuda_breakdown.png          CUDA time breakdown (kernel / transfer / overhead)
+    scaling_pthread.png   SpeedUp vs threads, line per N (pthread)
+    scaling_openmp.png    SpeedUp vs threads, line per N (OpenMP)
+    speedup_gpu.png       CUDA end-to-end vs kernel-only SpeedUp (bar)
 
 Run from anywhere:
     python3 scripts/plot_all.py
@@ -38,52 +39,60 @@ STATS_DIR.mkdir(exist_ok=True)
 HW_CONCURRENCY = os.cpu_count()
 
 
-# ---- Load CSVs (missing files are skipped, not fatal) ----------------------
-def load_csv(name: str) -> Optional[pd.DataFrame]:
+# ---- Loaders ---------------------------------------------------------------
+# CPU CSVs (new schema): elements,[threads,]avg_time_ms,throughput_meps,correct
+def load_cpu(name: str) -> Optional[pd.DataFrame]:
     path = CSV_DIR / name
     if not path.exists():
-        print(f"Note: {path.name} not found — charts that need it will be skipped.")
+        print(f"Note: {path.name} not found — chart that needs it will be skipped.")
+        return None
+    df = pd.read_csv(path)
+    df["elements"] = df["elements"].astype(np.int64)
+    if "threads" in df.columns:
+        df["threads"] = df["threads"].astype(int)
+    return df
+
+
+# CUDA CSV (old schema): N,execution_ms,computation_ms,transfer_ms,...
+def load_cuda() -> Optional[pd.DataFrame]:
+    path = CSV_DIR / "results_cuda.csv"
+    if not path.exists():
+        print(f"Note: {path.name} not found — CUDA chart will be skipped.")
         return None
     df = pd.read_csv(path)
     df["N"] = df["N"].astype(np.int64)
     return df
 
 
-seq  = load_csv("results_sequential.csv")
-thr  = load_csv("results_stdthread.csv")
-omp  = load_csv("results_openmp.csv")
-cuda = load_csv("results_cuda.csv")
+seq_df  = load_cpu("radix_sort_stats.csv")
+thr_df  = load_cpu("radix_sort_pthread_stats.csv")
+omp_df  = load_cpu("radix_sort_omp_stats.csv")
+cuda_df = load_cuda()
 
-assert seq is not None, "results_sequential.csv is required (provides SpeedUp baseline)"
+assert seq_df is not None, \
+    "radix_sort_stats.csv (sequential) is required — it provides the SpeedUp baseline"
 
-seq_baseline      = seq.set_index("N")["execution_ms"].sort_index()
-seq_baseline_ns   = set(seq_baseline.index.astype(int))
-
-
-# ---- Helpers: best (min exec_ms / max MOPS) per N across thread counts ----
-def best_exec_per_N(df: pd.DataFrame) -> pd.Series:
-    if "num_threads" in df.columns:
-        return df.groupby("N")["execution_ms"].min().sort_index()
-    return df.set_index("N")["execution_ms"].sort_index()
-
-
-def best_mops_per_N(df: pd.DataFrame) -> pd.Series:
-    if "num_threads" in df.columns:
-        return df.groupby("N")["performance_mops"].max().sort_index()
-    return df.set_index("N")["performance_mops"].sort_index()
+# Sequential baseline: elements -> avg_time_ms (each row is mean of 5 runs)
+seq_baseline    = seq_df.set_index("elements")["avg_time_ms"].sort_index()
+seq_baseline_ns = set(seq_baseline.index.astype(int))
 
 
 # ===========================================================================
-# Chart 1 & 2: Strong-scaling SpeedUp (one PNG per CPU implementation)
+# Strong-scaling SpeedUp plot (per CPU implementation)
+# X = thread count (log_2)   Y = SpeedUp = t_seq / t_impl   line per N
 # ===========================================================================
 def plot_scaling(df: Optional[pd.DataFrame], png_name: str, title: str) -> None:
     if df is None:
         return
+    if "threads" not in df.columns:
+        print(f"Skip {png_name}: CSV has no `threads` column")
+        return
 
-    sizes   = sorted(set(df["N"].unique()) & seq_baseline_ns)
-    plot_df = df[df["N"].isin(sizes)]
-    threads = sorted(plot_df["num_threads"].unique())
+    sizes   = sorted(set(df["elements"].unique()) & seq_baseline_ns)
+    plot_df = df[df["elements"].isin(sizes)]
+    threads = sorted(plot_df["threads"].unique())
     if not sizes or not threads:
+        print(f"Skip {png_name}: no overlap with sequential baseline")
         return
 
     fig, ax = plt.subplots(figsize=(9, 5))
@@ -91,12 +100,12 @@ def plot_scaling(df: Optional[pd.DataFrame], png_name: str, title: str) -> None:
 
     max_speedup = 0.0
     for i, N in enumerate(sizes):
-        sub = plot_df[plot_df["N"] == N].sort_values("num_threads")
-        speedup = float(seq_baseline.loc[N]) / sub["execution_ms"].values
+        sub = plot_df[plot_df["elements"] == N].sort_values("threads")
+        speedup = float(seq_baseline.loc[N]) / sub["avg_time_ms"].values
         max_speedup = max(max_speedup, float(speedup.max()))
-        line, = ax.plot(sub["num_threads"], speedup, marker="o",
+        line, = ax.plot(sub["threads"], speedup, marker="o",
                         color=cmap(i), label=f"N = {int(N):,}")
-        for x, y in zip(sub["num_threads"], speedup):
+        for x, y in zip(sub["threads"], speedup):
             ax.annotate(f"{y:.2f}x", xy=(x, y), xytext=(7, 0),
                         textcoords="offset points", fontsize=8,
                         ha="left", va="center", color=line.get_color())
@@ -130,14 +139,22 @@ def plot_scaling(df: Optional[pd.DataFrame], png_name: str, title: str) -> None:
 
 
 # ===========================================================================
-# Chart 3: CUDA SpeedUp — end-to-end vs kernel-only
+# CUDA SpeedUp — end-to-end vs kernel-only (bar chart per N)
 # ===========================================================================
 def plot_speedup_gpu() -> None:
-    if cuda is None:
+    if cuda_df is None:
         return
 
-    df = cuda.merge(seq[["N", "execution_ms"]].rename(
-        columns={"execution_ms": "t_seq"}), on="N")
+    # Bridge the schema mismatch: cuda uses N, sequential uses elements.
+    baseline = pd.DataFrame({
+        "N":     list(seq_baseline.index),
+        "t_seq": list(seq_baseline.values),
+    })
+    df = cuda_df.merge(baseline, on="N", how="inner").sort_values("N")
+    if df.empty:
+        print("Skip speedup_gpu.png: no N overlap between cuda and sequential CSVs")
+        return
+
     df["se"] = df["t_seq"] / df["execution_ms"]
     df["sk"] = df["t_seq"] / df["computation_ms"]
 
@@ -170,149 +187,30 @@ def plot_speedup_gpu() -> None:
 
 
 # ===========================================================================
-# Chart 4: Execution time vs N — all 4 implementations (line, log-log)
-# ===========================================================================
-def plot_exec_time_comparison() -> None:
-    impls = [("Sequential", best_exec_per_N(seq))]
-    if thr  is not None: impls.append(("std::thread (best T)", best_exec_per_N(thr)))
-    if omp  is not None: impls.append(("OpenMP (best T)",      best_exec_per_N(omp)))
-    if cuda is not None: impls.append(("CUDA (end-to-end)",    best_exec_per_N(cuda)))
-
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    cmap = plt.get_cmap("tab10")
-    for i, (label, s) in enumerate(impls):
-        ax.plot(s.index, s.values, marker="o", color=cmap(i), label=label)
-        for x, y in zip(s.index, s.values):
-            ax.annotate(f"{y:.2f} ms", xy=(x, y), xytext=(6, 4),
-                        textcoords="offset points", fontsize=8,
-                        color=cmap(i))
-
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    sizes = sorted(seq["N"].unique())
-    ax.set_xticks(sizes)
-    ax.set_xticklabels([f"{int(N):,}" for N in sizes])
-    ax.set_xlabel("Input size N")
-    ax.set_ylabel("Execution time (ms, log scale)")
-    ax.set_title("Execution Time vs Input Size (all implementations)")
-    ax.legend(loc="upper left", fontsize=9)
-    ax.grid(True, which="both", alpha=0.3)
-    plt.tight_layout()
-    out = STATS_DIR / "exec_time_comparison.png"
-    plt.savefig(out, dpi=150)
-    plt.close(fig)
-    print(f"Saved {out}")
-
-
-# ===========================================================================
-# Chart 5: Achievable Performance (MOPS) — grouped bar by N
-# ===========================================================================
-def plot_mops() -> None:
-    impls = [("Sequential", best_mops_per_N(seq))]
-    if thr  is not None: impls.append(("std::thread (best T)", best_mops_per_N(thr)))
-    if omp  is not None: impls.append(("OpenMP (best T)",      best_mops_per_N(omp)))
-    if cuda is not None: impls.append(("CUDA",                 best_mops_per_N(cuda)))
-
-    sizes    = sorted(seq["N"].unique())
-    n_impls  = len(impls)
-    x        = np.arange(len(sizes))
-    w        = 0.8 / n_impls
-    cmap     = plt.get_cmap("tab10")
-
-    fig, ax = plt.subplots(figsize=(10, 5.5))
-    for i, (label, s) in enumerate(impls):
-        offsets = x + w * (i - (n_impls - 1) / 2)
-        values  = [float(s.get(N, 0.0)) for N in sizes]
-        bars = ax.bar(offsets, values, w, color=cmap(i), label=label)
-        for r, v in zip(bars, values):
-            ax.annotate(f"{v:,.0f}",
-                        xy=(r.get_x() + r.get_width()/2, v),
-                        xytext=(0, 3), textcoords="offset points",
-                        ha="center", va="bottom", fontsize=8)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels([f"{int(N):,}" for N in sizes])
-    ax.set_xlabel("Input size N")
-    ax.set_ylabel("Achievable performance (MOPS)")
-    ax.set_title("Achievable Performance — best MOPS per implementation per N")
-    ax.legend(loc="upper left", fontsize=9)
-    ax.grid(True, axis="y", alpha=0.3)
-    plt.tight_layout()
-    out = STATS_DIR / "performance_mops.png"
-    plt.savefig(out, dpi=150)
-    plt.close(fig)
-    print(f"Saved {out}")
-
-
-# ===========================================================================
-# Chart 6: CUDA time breakdown — stacked bar (kernel / transfer / overhead)
-# ===========================================================================
-def plot_cuda_breakdown() -> None:
-    if cuda is None:
-        return
-
-    df = cuda.sort_values("N").copy()
-    kernel   = df["computation_ms"].values
-    transfer = df["transfer_ms"].values
-    overhead = (df["execution_ms"] - df["computation_ms"] - df["transfer_ms"]) \
-                  .clip(lower=0).values
-
-    x = np.arange(len(df))
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    ax.bar(x, kernel,   color="tab:blue",   label="Kernel (computation)")
-    ax.bar(x, transfer, bottom=kernel,
-           color="tab:orange", label="Transfer (H2D + D2H)")
-    ax.bar(x, overhead, bottom=kernel + transfer,
-           color="tab:grey",   label="Overhead (malloc / free / sync)")
-
-    totals = kernel + transfer + overhead
-    for xi, total in zip(x, totals):
-        ax.annotate(f"{total:.2f} ms", xy=(xi, total), xytext=(0, 3),
-                    textcoords="offset points",
-                    ha="center", va="bottom", fontsize=9)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels([f"{int(n):,}" for n in df["N"]])
-    ax.set_xlabel("N (input size)")
-    ax.set_ylabel("Time (ms)")
-    ax.set_title("CUDA Execution Time Breakdown")
-    ax.legend(loc="upper left", fontsize=9)
-    ax.grid(True, axis="y", alpha=0.3)
-    plt.tight_layout()
-    out = STATS_DIR / "cuda_breakdown.png"
-    plt.savefig(out, dpi=150)
-    plt.close(fig)
-    print(f"Saved {out}")
-
-
-# ===========================================================================
-# Console: SpeedUp pivot tables for the report
+# Console: SpeedUp pivot tables (drop straight into the report)
 # ===========================================================================
 def print_speedup_pivot(df: Optional[pd.DataFrame], label: str) -> None:
-    if df is None or "num_threads" not in df.columns:
+    if df is None or "threads" not in df.columns:
         return
-    sub = df[df["N"].isin(seq_baseline.index)].copy()
+    sub = df[df["elements"].isin(seq_baseline_ns)].copy()
     if sub.empty:
         return
-    sub["speedup"] = sub["N"].map(seq_baseline) / sub["execution_ms"]
+    sub["speedup"] = sub["elements"].map(seq_baseline) / sub["avg_time_ms"]
     print(f"{label}:")
-    print(sub.pivot(index="num_threads", columns="N", values="speedup")
+    print(sub.pivot(index="threads", columns="elements", values="speedup")
               .round(2).to_string())
     print()
 
 
 def main() -> None:
-    print_speedup_pivot(thr, "SpeedUp summary (std::thread)")
-    print_speedup_pivot(omp, "SpeedUp summary (OpenMP)")
+    print_speedup_pivot(thr_df, "SpeedUp summary (pthread)")
+    print_speedup_pivot(omp_df, "SpeedUp summary (OpenMP)")
 
-    plot_scaling(thr, "scaling_stdthread.png",
-                 "std::thread Strong Scaling (SpeedUp vs Урсгалын тоо)")
-    plot_scaling(omp, "scaling_openmp.png",
+    plot_scaling(thr_df, "scaling_pthread.png",
+                 "pthread Strong Scaling (SpeedUp vs Урсгалын тоо)")
+    plot_scaling(omp_df, "scaling_openmp.png",
                  "OpenMP Strong Scaling (SpeedUp vs Урсгалын тоо)")
     plot_speedup_gpu()
-    plot_exec_time_comparison()
-    plot_mops()
-    plot_cuda_breakdown()
 
 
 if __name__ == "__main__":

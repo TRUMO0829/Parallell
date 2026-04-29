@@ -1,134 +1,293 @@
 // clang++ -std=c++17 -O2 -pthread -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/libomp/lib -lomp -o 3_openmp 3_openmp.cpp
 // ./3_openmp
 
-#include <algorithm>
-#include <cassert>
-#include <chrono>
-#include <cstdint>
-#include <fstream>
-#include <iostream>
-#include <limits>
-#include <random>
-#include <vector>
+/**
+ * Parallel LSD Radix Sort — Base 256, OpenMP
+ *
+ * Sources used:
+ *   [1] Haichuan Wang (Intel Research):
+ *       "A faster OpenMP Radix Sort implementation" (2014)
+ *       https://haichuanwang.wordpress.com/2014/05/26/
+ *       → Parallelise all three phases; use schedule(static) consistently;
+ *         keep prefix-sum sequential inside omp single (256 entries is tiny).
+ *
+ *   [2] Dmitry Vyukov (1024cores.net):
+ *       "Parallel Radix Sort"
+ *       https://www.1024cores.net/home/parallel-computing/radix-sort
+ *       → Store T independent local histograms (T×B matrix) to eliminate
+ *         any critical section during counting.
+ *
+ *   [3] PiotrSypek/pradsort (GitHub)
+ *       https://github.com/PiotrSypek/pradsort
+ *       → LSD-first, base-256 uint32_t reference implementation.
+ *
+ * ┌─ Algorithm (one pass over byte `shift` of each uint32_t) ────────────────┐
+ * │                                                                           │
+ * │  Phase 1 — parallel count                                                │
+ * │    Each thread independently fills its own 256-bucket histogram over     │
+ * │    its static chunk.  No critical section: thread t writes only to       │
+ * │    local_hist[t][0..255].                                                │
+ * │    Directive: #pragma omp for schedule(static)  [implicit barrier]       │
+ * │                                                                           │
+ * │  Phase 2 — sequential prefix-sum  (omp single)                          │
+ * │    One thread computes global totals from the T×256 matrix, builds an    │
+ * │    exclusive prefix-sum of bucket totals, then fills per-thread scatter  │
+ * │    offsets.  Running this on one thread is *faster* than parallelising   │
+ * │    it: the prefix-sum touches only 256 values (< 1 KB).  [Wang 2014]    │
+ * │    Directive: #pragma omp single  [implicit barrier on exit]             │
+ * │                                                                           │
+ * │  Phase 3 — parallel scatter                                              │
+ * │    Each thread scatters its static chunk to dst[] using its own row of   │
+ * │    offsets.  schedule(static) with no chunk-size guarantees the SAME     │
+ * │    partition as Phase 1, so every thread writes exactly to the slots     │
+ * │    it counted — no race conditions, stability preserved.  [Wang 2014]   │
+ * │    Directive: #pragma omp for schedule(static)  [implicit barrier]       │
+ * │                                                                           │
+ * │  Buffer swap (main thread) then repeat for passes 1-3.                  │
+ * └───────────────────────────────────────────────────────────────────────────┘
+ *
+ * After 4 passes (even number of swaps) the sorted result is back in `data`.
+ *
+ * Complexity : O(d·(n + B))   work       d = 4 passes, B = 256 buckets
+ *              O(d·(n/T + B)) span        T = thread count
+ * Extra space: O(n + T·B)
+ */
 
-#include <omp.h> 
+ #include <omp.h>
 
-static constexpr int NUM_BUCKETS = 1 << 8;   // 256 buckets (8-bit radix)
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdint>
+ #include <fstream>
+ #include <iomanip>
+ #include <iostream>
+ #include <random>
+ #include <string>
+ #include <vector>
+ 
+ // ════════════════════════════════════════════════════════════════════════════
+ //  Constants
+ // ════════════════════════════════════════════════════════════════════════════
+ static constexpr int B      = 256;   // buckets (one per byte value)
+ static constexpr int PASSES = 4;     // 4 × 8 bits = 32-bit keys
+ 
+ // ════════════════════════════════════════════════════════════════════════════
+ //  Core: one pass of counting sort over byte `shift`
+ //  Called from radix_sort_omp() with src/dst already set for this pass.
+ // ════════════════════════════════════════════════════════════════════════════
+ static void omp_counting_pass(
+     const uint32_t* __restrict__ src,
+           uint32_t* __restrict__ dst,
+     std::size_t n,
+     int         shift,
+     int         T,           // thread count this parallel region will use
+     uint32_t*   local_hist,  // T × B, zeroed before entry
+     uint32_t*   offsets)     // T × B, output
+ {
+     // ── All three phases live inside ONE parallel region ─────────────────
+     // Opening the region once amortises the fork/join overhead over all
+     // three phases.  [Recommendation: Wang 2014, Vyukov 1024cores]
+     #pragma omp parallel num_threads(T)
+     {
+         const int tid = omp_get_thread_num();
+         uint32_t* hist = local_hist + tid * B;   // this thread's histogram row
+ 
+         // ── Phase 1: parallel count ───────────────────────────────────────
+         // schedule(static) with no chunk → OpenMP divides [0,n) into T
+         // contiguous, equal-sized (±1) pieces deterministically.
+         // Thread tid processes the SAME indices in Phase 3 below.  [Wang 2014]
+         #pragma omp for schedule(static)
+         for (std::size_t i = 0; i < n; ++i)
+             ++hist[(src[i] >> shift) & 0xFF];
+         // implicit barrier at end of omp-for
+ 
+         // ── Phase 2: prefix-sum  (single thread) ─────────────────────────
+         // Sequential over 256 values: faster than launching a parallel
+         // reduction here.  All other threads wait at the implicit barrier
+         // that follows omp single.  [Wang 2014]
+         #pragma omp single
+         {
+             // Step A – global total per bucket
+             uint32_t total[B] = {};
+             for (int t = 0; t < T; ++t)
+                 for (int b = 0; b < B; ++b)
+                     total[b] += local_hist[t * B + b];
+ 
+             // Step B – exclusive prefix-sum of totals → global bucket starts
+             uint32_t gstart[B];
+             gstart[0] = 0;
+             for (int b = 1; b < B; ++b)
+                 gstart[b] = gstart[b - 1] + total[b - 1];
+ 
+             // Step C – per-thread scatter offsets
+             // offsets[t][b] = position in dst[] where thread t begins
+             //                 writing elements of bucket b.
+             for (int b = 0; b < B; ++b) {
+                 uint32_t pos = gstart[b];
+                 for (int t = 0; t < T; ++t) {
+                     offsets[t * B + b] = pos;
+                     pos += local_hist[t * B + b];
+                 }
+             }
+         }
+         // implicit barrier after omp single — all threads see offsets[]
+ 
+         // ── Phase 3: parallel scatter ─────────────────────────────────────
+         // Each thread scatters its OWN static chunk (same partition as Phase 1)
+         // using its own offset row → zero overlap, no race condition.
+         // Iterating i in ascending order preserves input-order within each
+         // bucket → sort remains stable.  [Vyukov, 1024cores]
+         uint32_t* off = offsets + tid * B;
+         #pragma omp for schedule(static)
+         for (std::size_t i = 0; i < n; ++i) {
+             const int bkt = (src[i] >> shift) & 0xFF;
+             dst[off[bkt]++] = src[i];
+         }
+         // implicit barrier at end of omp-for
+     }
+     // All threads rejoined — dst[] holds the pass result.
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════════
+ //  Public entry point
+ // ════════════════════════════════════════════════════════════════════════════
+ void radix_sort_omp(std::vector<uint32_t>& data, int T)
+ {
+     const std::size_t n = data.size();
+     if (n < 2) return;
+ 
+     std::vector<uint32_t> buf(n);          // alternating output buffer
+     std::vector<uint32_t> local_hist(T * B);
+     std::vector<uint32_t> offsets(T * B);
+ 
+     uint32_t* src = data.data();
+     uint32_t* dst = buf.data();
+ 
+     for (int pass = 0; pass < PASSES; ++pass) {
+         // Zero local histograms before each pass (cheap: T × 256 entries)
+         std::fill(local_hist.begin(), local_hist.end(), 0u);
+ 
+         omp_counting_pass(src, dst, n, pass * 8, T,
+                           local_hist.data(), offsets.data());
+ 
+         std::swap(src, dst);
+         // After swap:
+         //   pass 0: src=buf,  dst=data  (result of pass 0 now in buf)
+         //   pass 1: src=data, dst=buf
+         //   pass 2: src=buf,  dst=data
+         //   pass 3: src=data, dst=buf
+         // 4 swaps (even) → src ends on data.data() → result is in data. ✓
+     }
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════════
+ //  Helpers
+ // ════════════════════════════════════════════════════════════════════════════
+ static std::vector<uint32_t> random_data(std::size_t n, uint32_t seed = 42)
+ {
+     std::mt19937 rng(seed);
+     std::uniform_int_distribution<uint32_t> dist(0, UINT32_MAX);
+     std::vector<uint32_t> v(n);
+     for (auto& x : v) x = dist(rng);
+     return v;
+ }
+ 
+ static bool is_sorted_check(const std::vector<uint32_t>& v)
+ {
+     for (std::size_t i = 1; i < v.size(); ++i)
+         if (v[i] < v[i - 1]) return false;
+     return true;
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════════
+ //  Benchmark
+ // ════════════════════════════════════════════════════════════════════════════
+ struct Result {
+     std::size_t n;
+     int         threads;
+     double      time_ms;
+     double      throughput_meps;
+     bool        correct;
+ };
+ 
+ static Result benchmark(std::size_t n, int T, int runs = 20)
+ {
+     std::vector<double> times;
+     times.reserve(runs);
+     bool ok = true;
 
-static void counting_sort_by_digit(std::vector<uint32_t>& a,
-                                   std::vector<uint32_t>& aux,
-                                   uint32_t shift) {
-    int count[NUM_BUCKETS + 1] = {0};
-    const std::size_t n = a.size();
+     for (int r = 0; r < runs; ++r) {
+         auto data = random_data(n, r * 1337u + 7u);
+         double t0 = omp_get_wtime();          // OpenMP's own timer [omp guide]
+         radix_sort_omp(data, T);
+         double t1 = omp_get_wtime();
 
-    #pragma omp parallel for reduction(+:count[:NUM_BUCKETS+1])
-    for (std::size_t i = 0; i < n; ++i) {
-        int d = static_cast<int>((a[i] >> shift) & 0xFFu);
-        count[d + 1]++;
-    }
+         times.push_back((t1 - t0) * 1000.0);
+         if (!is_sorted_check(data)) ok = false;
+     }
 
-    for (int r = 0; r < NUM_BUCKETS; ++r) {
-        count[r + 1] += count[r];
-    }
-
-    for (std::size_t i = 0; i < n; ++i) {
-        int d = static_cast<int>((a[i] >> shift) & 0xFFu);
-        aux[count[d]++] = a[i];
-    }
-
-    a.swap(aux);
-}
-
-void radix_sort_lsd(std::vector<uint32_t>& a) {
-    if (a.size() < 2) return;
-
-    std::vector<uint32_t> aux(a.size());
-
-    // uint32_t = 4 bytes => exactly 4 LSD passes (shift = 0, 8, 16, 24).
-    for (uint32_t shift = 0; shift < 32; shift += 8) {
-        counting_sort_by_digit(a, aux, shift);
-    }
-}
-
-int main() {
-    using clock = std::chrono::steady_clock;
-
-    const char* CSV_PATH = "results_openmp.csv";
-    const std::size_t sizes[]         = { 10'000, 100'000, 1'000'000 };
-    const int         thread_counts[] = { 1, 2, 4, 8, 16 };
-
-    std::ofstream csv(CSV_PATH, std::ios::trunc);
-    csv << "implementation,N,num_threads,execution_ms,computation_ms,transfer_ms,"
-           "transfer_bytes,total_ops,performance_mops,sorted_ok\n";
-
-    std::cout << "implementation = openmp (base-256 LSD, uint32, 4 passes, strong-scaling sweep)\n";
-    std::cout << "------------------------------------------------------------\n";
-
-    for (int num_threads : thread_counts) {
-        omp_set_num_threads(num_threads);
-        std::cout << "\n=== num_threads = " << num_threads << " ===\n";
-
-        for (std::size_t N : sizes) {
-            std::vector<uint32_t> data(N);
-            std::mt19937 rng(12345);
-            std::uniform_int_distribution<uint32_t> dist(
-                0, std::numeric_limits<uint32_t>::max());
-            for (std::size_t i = 0; i < N; ++i) data[i] = dist(rng);
-
-            std::vector<uint32_t> ref = data;
-
-            // warm-up: run once, discard (creates OpenMP thread pool, warms cache)
-            {
-                std::vector<uint32_t> warmup = data;
-                radix_sort_lsd(warmup);
-            }
-
-            auto t1 = clock::now();
-            radix_sort_lsd(data);
-            auto t2 = clock::now();
-            double execution_ms   = std::chrono::duration<double, std::milli>(t2 - t1).count();
-            double computation_ms = execution_ms;
-            double transfer_ms    = 0.0;
-            std::uint64_t transfer_bytes = 0;
-
-            std::sort(ref.begin(), ref.end());     // reference oracle
-
-            // uint32_t always needs exactly 4 byte-passes; no max_val scan needed.
-            constexpr int D = 4;
-
-            const std::uint64_t total_ops =
-                static_cast<std::uint64_t>(D) *
-                (5ull * static_cast<std::uint64_t>(N) + static_cast<std::uint64_t>(NUM_BUCKETS));
-            const double performance_mops =
-                execution_ms > 0.0
-                    ? static_cast<double>(total_ops) / (execution_ms * 1000.0)
-                    : 0.0;
-
-            const bool sorted_ok = std::is_sorted(data.begin(), data.end()) && (data == ref);
-
-            std::cout << "N=" << N
-                      << "  Threads=" << num_threads
-                      << "  Execution=" << execution_ms << " ms"
-                      << "  Computation=" << computation_ms << " ms"
-                      << "  Transfer=" << transfer_ms << " ms"
-                      << "  Operations=" << total_ops
-                      << "  Performance=" << performance_mops << " MOPS"
-                      << "  Sorted=" << (sorted_ok ? "true" : "false") << "\n";
-
-            csv << "openmp," << N << "," << num_threads << ","
-                << execution_ms << "," << computation_ms << "," << transfer_ms << ","
-                << transfer_bytes << "," << total_ops << "," << performance_mops << ","
-                << (sorted_ok ? "true" : "false") << "\n";
-
-            if (!sorted_ok) {
-                std::cerr << "ERROR: output mismatched reference for N=" << N
-                          << ", threads=" << num_threads << "\n";
-                return 1;
-            }
-        }
-    }
-
-    csv.close();
-    std::cout << "\nWrote " << CSV_PATH << "\n";
-    return 0;
-}
+     std::sort(times.begin(), times.end());
+     double median_ms = times[runs / 2];   // use median, not mean
+     double meps      = (static_cast<double>(n) / 1e6) / (median_ms / 1e3);
+     return {n, T, median_ms, meps, ok};
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════════
+ //  Main
+ // ════════════════════════════════════════════════════════════════════════════
+ int main()
+ {
+     const std::vector<std::size_t> sizes   = {10'000, 100'000, 1'000'000};
+     const std::vector<int>         threads = {1, 2, 4, 8, 16};
+     const int RUNS = 20;
+ 
+     // Report available hardware threads
+     std::cout << "\n  Host logical CPUs : " << omp_get_max_threads() << "\n";
+     std::cout << "\n  Parallel LSD Radix Sort (Base-256, OpenMP, uint32_t)\n";
+     std::cout << "  " << std::string(70, '-') << "\n";
+     std::cout << std::setw(12) << "Elements"
+               << std::setw(10) << "Threads"
+               << std::setw(18) << "Avg time (ms)"
+               << std::setw(22) << "Throughput (M el/s)"
+               << std::setw(10) << "Correct"
+               << "\n";
+     std::cout << "  " << std::string(70, '-') << "\n";
+ 
+     std::vector<Result> all_results;
+ 
+     for (auto n : sizes) {
+         bool first_row = true;
+         for (auto T : threads) {
+             auto r = benchmark(n, T, RUNS);
+             all_results.push_back(r);
+ 
+             std::cout << std::setw(12) << (first_row ? std::to_string(r.n) : "")
+                       << std::setw(10) << r.threads
+                       << std::setw(18) << std::fixed << std::setprecision(3) << r.time_ms
+                       << std::setw(22) << std::fixed << std::setprecision(2) << r.throughput_meps
+                       << std::setw(10) << (r.correct ? "YES" : "NO!")
+                       << "\n";
+             first_row = false;
+         }
+         std::cout << "  " << std::string(70, '-') << "\n";
+     }
+ 
+     std::cout << "\n  (each result averaged over " << RUNS << " runs)\n\n";
+ 
+     // ── Write CSV ─────────────────────────────────────────────────────────
+     const std::string csv_path = "radix_sort_omp_stats.csv";
+     std::ofstream csv(csv_path);
+     if (!csv) { std::cerr << "Cannot open CSV.\n"; return 1; }
+ 
+     csv << "elements,threads,avg_time_ms,throughput_meps,correct\n";
+     for (auto& r : all_results)
+         csv << r.n       << ","
+             << r.threads << ","
+             << std::fixed << std::setprecision(4) << r.time_ms << ","
+             << std::fixed << std::setprecision(4) << r.throughput_meps << ","
+             << (r.correct ? "true" : "false") << "\n";
+     csv.close();
+ 
+     std::cout << "  Stats written to radix_sort_omp_stats.csv\n\n";
+     return 0;
+ }

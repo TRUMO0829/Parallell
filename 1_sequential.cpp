@@ -1,125 +1,139 @@
-// g++ -O2 -std=c++17 1_sequential.cpp -o 1_sequential
+ // g++ -O2 -std=c++17 -pthread 1_sequential.cpp -o 1_sequential
 // ./1_sequential
+
 #include <algorithm>
-#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
-#include <limits>
+#include <numeric>
 #include <random>
+#include <string>
 #include <vector>
 
-static constexpr int NUM_BUCKETS = 1 << 8;  
+static void counting_sort_pass(const std::vector<uint32_t> &in,
+                               std::vector<uint32_t> &out,
+                               int shift) 
+{
+  constexpr int B = 256; 
+  std::size_t n = in.size();
 
-static void counting_sort_by_digit(std::vector<uint32_t>& a,
-                                   std::vector<uint32_t>& aux,
-                                   uint32_t shift) {
-    int count[NUM_BUCKETS + 1] = {0};
-    const std::size_t n = a.size();
+  uint32_t count[B] = {};
+  for (std::size_t i = 0; i < n; ++i)
+    ++count[(in[i] >> shift) & 0xFF];
 
-    // ---- (1) histogram: count how many keys have each byte value -----------
-    for (std::size_t i = 0; i < n; ++i) {
-        int d = static_cast<int>((a[i] >> shift) & 0xFFu);
-        count[d + 1]++;
-    }
+  uint32_t prefix[B];
+  prefix[0] = 0;
+  for (int k = 1; k < B; ++k)
+    prefix[k] = prefix[k - 1] + count[k - 1];
 
-    // ---- (2) prefix sum: count[d] becomes the start index for bucket d -----
-    for (int r = 0; r < NUM_BUCKETS; ++r) {
-        count[r + 1] += count[r];
-    }
-
-    // ---- (3) distribute: scatter each key to its bucket, advancing the -----
-    for (std::size_t i = 0; i < n; ++i) {
-        int d = static_cast<int>((a[i] >> shift) & 0xFFu);
-        aux[count[d]++] = a[i];
-    }
-
-    a.swap(aux);
+  for (std::size_t i = 0; i < n; ++i) {
+    int bucket = (in[i] >> shift) & 0xFF;
+    out[prefix[bucket]++] = in[i];
+  }
 }
 
-void radix_sort_lsd(std::vector<uint32_t>& a) {
-    if (a.size() < 2) return;
+void radix_sort(std::vector<uint32_t> &data) {
+  std::size_t n = data.size();
+  if (n < 2)
+    return;
 
-    std::vector<uint32_t> aux(a.size());
+  std::vector<uint32_t> tmp(n);
 
-    for (uint32_t shift = 0; shift < 32; shift += 8) {
-        counting_sort_by_digit(a, aux, shift);
-    }
+  counting_sort_pass(data, tmp, 0);
+  counting_sort_pass(tmp, data, 8);
+  counting_sort_pass(data, tmp, 16);
+  counting_sort_pass(tmp, data, 24);
+}
+
+std::vector<uint32_t> random_data(std::size_t n, uint32_t seed = 42) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<uint32_t> dist(0, UINT32_MAX);
+  std::vector<uint32_t> v(n);
+  for (auto &x : v)
+    x = dist(rng);
+  return v;
+}
+
+bool is_sorted_check(const std::vector<uint32_t> &v) {
+  for (std::size_t i = 1; i < v.size(); ++i)
+    if (v[i] < v[i - 1])
+      return false;
+  return true;
+}
+
+struct Result {
+  std::size_t n;
+  double time_ms;
+  double throughput_meps;
+  bool correct;
+};
+
+Result benchmark(std::size_t n, int runs = 20) {
+  std::vector<double> times;
+  times.reserve(runs);
+  bool ok = true;
+
+  for (int r = 0; r < runs; ++r) {
+    auto data = random_data(n, /*seed=*/r * 1337 + 7);
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    radix_sort(data);
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    times.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    if (!is_sorted_check(data))
+      ok = false;
+  }
+
+  std::sort(times.begin(), times.end());
+  double median_ms = times[runs / 2];   // use median, not mean
+  double meps = (static_cast<double>(n) / 1e6) / (median_ms / 1000.0);
+
+  return {n, median_ms, meps, ok};
 }
 
 int main() {
-    using clock = std::chrono::steady_clock;
+  const std::vector<std::size_t> sizes = {10'000, 100'000, 1'000'000};
+  const int RUNS = 20;
 
-    const char* CSV_PATH = "results_sequential.csv";
-    const std::size_t sizes[] = { 10'000, 100'000, 1'000'000 };
+  std::vector<Result> results;
+  results.reserve(sizes.size());
 
-    std::ofstream csv(CSV_PATH, std::ios::trunc);
-    csv << "implementation,N,num_threads,execution_ms,computation_ms,transfer_ms,"
-           "transfer_bytes,total_ops,performance_mops,sorted_ok\n";
+  std::cout << "\n  Sequential LSD Radix Sort (Base-256, uint32_t)\n";
+  std::cout << "  " << std::string(56, '-') << "\n";
+  std::cout << std::setw(12) << "Elements" << std::setw(16) << "Avg time (ms)"
+            << std::setw(20) << "Throughput (M el/s)" << std::setw(10)
+            << "Correct"
+            << "\n";
+  std::cout << "  " << std::string(56, '-') << "\n";
 
-    std::cout << "implementation = sequential (base-256 LSD, uint32, 4 passes)\n";
-    std::cout << "------------------------------------------------------------\n";
+  for (auto n : sizes) {
+    auto r = benchmark(n, RUNS);
+    results.push_back(r);
+    std::cout << std::setw(12) << r.n << std::setw(16) << std::fixed
+              << std::setprecision(3) << r.time_ms << std::setw(20)
+              << std::fixed << std::setprecision(2) << r.throughput_meps
+              << std::setw(10) << (r.correct ? "YES" : "NO!") << "\n";
+  }
+  std::cout << "  " << std::string(56, '-') << "\n\n";
+  std::cout << "  (each result averaged over " << RUNS << " runs)\n\n";
 
-    for (std::size_t N : sizes) {
-        std::vector<uint32_t> data(N);
-        std::mt19937 rng(12345);
-        std::uniform_int_distribution<uint32_t> dist(
-            0, std::numeric_limits<uint32_t>::max());
-        for (std::size_t i = 0; i < N; ++i) data[i] = dist(rng);
+  // ── Write CSV ──────────────────────────────
+  const std::string csv_path = "radix_sort_stats.csv";
+  std::ofstream csv(csv_path);
+  if (!csv) {
+    std::cerr << "Could not open " << csv_path << " for writing.\n";
+    return 1;
+  }
+  csv << "elements,avg_time_ms,throughput_meps,correct\n";
+  for (auto &r : results)
+    csv << r.n << "," << std::fixed << std::setprecision(4) << r.time_ms << ","
+        << std::fixed << std::setprecision(4) << r.throughput_meps << ","
+        << (r.correct ? "true" : "false") << "\n";
+  csv.close();
+  std::cout << "  Stats written to radix_sort_stats.csv\n\n";
 
-        std::vector<uint32_t> ref = data;
-
-        // ---- warm-up: run once, discard (warms cache, CPU freq) -----------
-        {
-            std::vector<uint32_t> warmup = data;
-            radix_sort_lsd(warmup);
-        }
-
-        // ---- time the radix sort ------------------------------------------
-        auto t1 = clock::now();
-        radix_sort_lsd(data);
-        auto t2 = clock::now();
-        double execution_ms   = std::chrono::duration<double, std::milli>(t2 - t1).count();
-        double computation_ms = execution_ms;     // no transfer phase
-        double transfer_ms    = 0.0;
-        std::uint64_t transfer_bytes = 0;
-
-        std::sort(ref.begin(), ref.end());        // reference oracle
-
-        // uint32_t always needs exactly 4 byte-passes; no max_val scan needed.
-        constexpr int D = 4;
-
-        const std::uint64_t total_ops =
-            static_cast<std::uint64_t>(D) *
-            (5ull * static_cast<std::uint64_t>(N) + static_cast<std::uint64_t>(NUM_BUCKETS));
-        const double performance_mops =
-            execution_ms > 0.0
-                ? static_cast<double>(total_ops) / (execution_ms * 1000.0)
-                : 0.0;
-
-        const bool sorted_ok = std::is_sorted(data.begin(), data.end()) && (data == ref);
-
-        std::cout << "N=" << N
-                  << "  Execution=" << execution_ms << " ms"
-                  << "  Computation=" << computation_ms << " ms"
-                  << "  Transfer=" << transfer_ms << " ms"
-                  << "  Operations=" << total_ops
-                  << "  Performance=" << performance_mops << " MOPS"
-                  << "  Sorted=" << (sorted_ok ? "true" : "false") << "\n";
-
-        csv << "sequential," << N << ",1,"
-            << execution_ms << "," << computation_ms << "," << transfer_ms << ","
-            << transfer_bytes << "," << total_ops << "," << performance_mops << ","
-            << (sorted_ok ? "true" : "false") << "\n";
-
-        if (!sorted_ok) {
-            std::cerr << "ERROR: output mismatched reference for N=" << N << "\n";
-            return 1;
-        }
-    }
-
-    csv.close();
-    std::cout << "Wrote " << CSV_PATH << "\n";
-    return 0;
+  return 0;
 }
