@@ -1,0 +1,385 @@
+ 1. SEQUENTIAL — 1_sequential.cpp                                                                                                                                                                        
+                                                                                                                                                                                                          
+  Style 1 — High-level / English                                                                                                                                                                          
+                                                                                                                                                                                                          
+  The program sorts 32-bit numbers by looking at them 8 bits at a time, from the lowest byte to the highest. There are 4 passes total. In each pass:                                                      
+  1. Look at one byte of every number and count how many fall into each of 256 buckets.
+  2. Use those counts to figure out where each bucket starts in the output.                                                                                                                               
+  3. Walk through the numbers again and place each one in its correct bucket position.
+                                                                                                                                                                                                          
+  The buffers swap roles between passes (input/output flip-flop). After 4 passes, the array is fully sorted. Everything runs on a single thread.                                                          
+                                                                                                                                                                                                          
+  Style 2 — Algorithmic / textbook                                                                                                                                                                        
+                                                                                                                                                                                                          
+  RADIX-SORT(data):
+      n ← length(data)                                                                                                                                                                                    
+      if n < 2: return
+      tmp ← new array[n]                                                                                                                                                                                  
+      src ← data;  dst ← tmp
+      for shift ∈ {0, 8, 16, 24}:                                                                                                                                                                         
+          COUNTING-PASS(src, dst, shift)
+          swap(src, dst)                                                                                                                                                                                  
+                                                                                                                                                                                                          
+  COUNTING-PASS(in, out, shift):
+      count[0..255] ← 0                                                                                                                                                                                   
+      for i ← 0 to n-1:
+          b ← (in[i] >> shift) AND 0xFF                                                                                                                                                                   
+          count[b] ← count[b] + 1
+                                                                                                                                                                                                          
+      prefix[0] ← 0                                                                                                                                                                                       
+      for k ← 1 to 255:
+          prefix[k] ← prefix[k-1] + count[k-1]                                                                                                                                                            
+                                                                                                                                                                                                          
+      for i ← 0 to n-1:
+          b ← (in[i] >> shift) AND 0xFF                                                                                                                                                                   
+          out[prefix[b]] ← in[i]
+          prefix[b] ← prefix[b] + 1                                                                                                                                                                       
+  
+  Style 3 — Block-diagram                                                                                                                                                                                 
+                  
+  ┌──────────────────────────────────────────────┐                                                                                                                                                        
+  │   PASS p ∈ {0,1,2,3}    shift = p * 8        │
+  ├──────────────────────────────────────────────┤                                                                                                                                                        
+  │ [1] HISTOGRAM   (single thread)              │                                                                                                                                                        
+  │        for each elem → count[bucket]++       │
+  ├──────────────────────────────────────────────┤                                                                                                                                                        
+  │ [2] PREFIX SUM  (single thread)              │
+  │        prefix[k] = Σ count[0..k-1]           │                                                                                                                                                        
+  ├──────────────────────────────────────────────┤                                                                                                                                                        
+  │ [3] SCATTER     (single thread)              │                                                                                                                                                        
+  │        out[prefix[bucket]++] = elem          │                                                                                                                                                        
+  ├──────────────────────────────────────────────┤                                                                                                                                                        
+  │ swap(src, dst)  →  next pass                 │
+  └──────────────────────────────────────────────┘                                                                                                                                                        
+                                                                                                                                                                                                          
+  ---
+  2. PTHREAD — 2_pthread.cpp                                                                                                                                                                              
+                  
+  Style 1 — High-level / English
+
+  Same 4-pass radix idea, but the array is split into T contiguous chunks — one per thread. In every pass:                                                                                                
+  - Each thread counts buckets only for its own chunk into its own private histogram (no clashes possible).
+  - Everyone waits at a barrier.                                                                                                                                                                          
+  - Thread 0 alone merges the histograms and computes, for every (thread, bucket) pair, where in the output that thread should start writing.
+  - Everyone waits again.                                                                                                                                                                                 
+  - Each thread scatters its chunk into the global output using its personal offsets.                                                                                                                     
+  - Wait, then thread 0 swaps the two buffers for the next pass.                     
+                                                                                                                                                                                                          
+  The barriers (manual since macOS lacks pthread_barrier_t) are what keep threads from racing ahead into stale data.                                                                                      
+                                                                                                                                                                                                          
+  Style 2 — Algorithmic / textbook                                                                                                                                                                        
+                                                                                                                                                                                                          
+  PARALLEL-RADIX-SORT(data, T):
+      n ← length(data); if n < 2: return                                                                                                                                                                  
+      buf        ← new array[n]
+      local_hist ← new matrix[T × 256]   // each thread owns a row                                                                                                                                        
+      offsets    ← new matrix[T × 256]                                                                                                                                                                    
+      barrier    ← BARRIER(T)                                                                                                                                                                             
+      src ← data;  dst ← buf                                                                                                                                                                              
+                                                                                                                                                                                                          
+      spawn T threads each running WORKER(tid)                                                                                                                                                            
+      join all threads
+                                                                                                                                                                                                          
+  WORKER(tid):    
+      chunk ← ⌈n / T⌉                                                                                                                                                                                     
+      lo ← tid * chunk
+      hi ← min(lo + chunk, n)                                                                                                                                                                             
+  
+      for pass ← 0 to 3:                                                                                                                                                                                  
+          shift ← pass * 8
+                                                                                                                                                                                                          
+          // ── Phase 1 : local histogram ──
+          local_hist[tid][0..255] ← 0                                                                                                                                                                     
+          for i ← lo to hi-1:                                                                                                                                                                             
+              b ← (src[i] >> shift) AND 0xFF
+              local_hist[tid][b] ← local_hist[tid][b] + 1                                                                                                                                                 
+          BARRIER                                                                                                                                                                                         
+  
+          // ── Phase 2 : global prefix (thread 0 only) ──                                                                                                                                                
+          if tid = 0:
+              for b ← 0 to 255:                                                                                                                                                                           
+                  total[b] ← Σ_{t=0..T-1} local_hist[t][b]
+              gstart[0] ← 0                                                                                                                                                                               
+              for b ← 1 to 255:
+                  gstart[b] ← gstart[b-1] + total[b-1]                                                                                                                                                    
+              for b ← 0 to 255:                                                                                                                                                                           
+                  pos ← gstart[b]
+                  for t ← 0 to T-1:                                                                                                                                                                       
+                      offsets[t][b] ← pos
+                      pos ← pos + local_hist[t][b]                                                                                                                                                        
+          BARRIER
+                                                                                                                                                                                                          
+          // ── Phase 3 : scatter ──
+          for i ← lo to hi-1:
+              b ← (src[i] >> shift) AND 0xFF                                                                                                                                                              
+              dst[offsets[tid][b]] ← src[i]
+              offsets[tid][b] ← offsets[tid][b] + 1                                                                                                                                                       
+          BARRIER                                                                                                                                                                                         
+  
+          if tid = 0: swap(src, dst)                                                                                                                                                                      
+          BARRIER 
+                                                                                                                                                                                                          
+  Style 3 — Block-diagram
+                                                                                                                                                                                                          
+          ┌────────────────────────────────────────────────┐
+          │   PASS p ∈ {0,1,2,3}     shift = p * 8         │
+          └────────────────────────────────────────────────┘                                                                                                                                              
+                                  │
+     ┌────────────┬───────────────┴───────────────┬─────────────┐                                                                                                                                         
+     ▼            ▼                               ▼             ▼                                                                                                                                         
+  THREAD 0     THREAD 1         . . .          THREAD T-2   THREAD T-1
+  [chunk 0]    [chunk 1]                       [chunk T-2]  [chunk T-1]                                                                                                                                   
+                                                                                                                                                                                                          
+  PHASE 1 — PARALLEL FOR  (each thread fills its own histogram row)                                                                                                                                       
+      local_hist[tid][bucket]++  for each elem in own chunk                                                                                                                                               
+  ═══════════════════════════ BARRIER ═══════════════════════════                                                                                                                                         
+                                                                                                                                                                                                          
+  PHASE 2 — SEQUENTIAL  (thread 0 only; T-1 others wait)                                                                                                                                                  
+      Σ local_hist columns  →  total[b]                                                                                                                                                                   
+      exclusive scan        →  gstart[b]                                                                                                                                                                  
+      distribute            →  offsets[t][b]
+  ═══════════════════════════ BARRIER ═══════════════════════════                                                                                                                                         
+                  
+  PHASE 3 — PARALLEL FOR  (each thread scatters its own chunk)                                                                                                                                            
+      dst[offsets[tid][bucket]++] = src[i]
+  ═══════════════════════════ BARRIER ═══════════════════════════                                                                                                                                         
+                                                                                                                                                                                                          
+  BUFFER SWAP — thread 0 only:  swap(src, dst)                                                                                                                                                            
+  ═══════════════════════════ BARRIER ═══════════════════════════                                                                                                                                         
+                                  │                                                                                                                                                                       
+                                  ▼
+                              next pass
+
+  ---
+  3. OPENMP — 3_openmp.cpp
+                                                                                                                                                                                                          
+  Style 1 — High-level / English
+                                                                                                                                                                                                          
+  Same algorithm as pthread, but instead of manually creating threads and barriers, you sprinkle OpenMP directives and the compiler handles the rest. For each pass the program opens one parallel region 
+  containing all three phases (cheaper than opening three separate regions):
+  - The histogram loop is split with #pragma omp for schedule(static) so each thread processes its slice and writes to its own row. OpenMP inserts a barrier when the loop ends.                          
+  - The prefix-sum is wrapped in #pragma omp single so just one thread runs it (256 entries — too small to be worth parallelizing). Another implicit barrier follows.                                     
+  - The scatter loop uses #pragma omp for schedule(static) again. Critically, static with no chunk size guarantees the same partition as Phase 1, so each thread scatters exactly the elements it counted
+  — no races, sort stays stable.                                                                                                                                                                          
+  - The team rejoins. The host driver swaps buffers and runs the next pass.                                                                                                                               
+                                                                                                                                                                                                          
+  Style 2 — Algorithmic / textbook                                                                                                                                                                        
+                  
+  RADIX-SORT-OMP(data, T):                                                                                                                                                                                
+      n ← length(data); if n < 2: return
+      buf        ← new array[n]                                                                                                                                                                           
+      local_hist ← new matrix[T × 256]
+      offsets    ← new matrix[T × 256]                                                                                                                                                                    
+      src ← data;  dst ← buf
+      for pass ← 0 to 3:                                                                                                                                                                                  
+          local_hist[*][*] ← 0
+          OMP-COUNTING-PASS(src, dst, n, pass * 8, T)                                                                                                                                                     
+          swap(src, dst)                                                                                                                                                                                  
+  
+  OMP-COUNTING-PASS(src, dst, n, shift, T):                                                                                                                                                               
+      parallel region with T threads:
+          tid ← omp_thread_num()                                                                                                                                                                          
+  
+          // ── Phase 1 : parallel-for, static schedule ──                                                                                                                                                
+          for i ← 0 to n-1   distributed by static schedule:
+              b ← (src[i] >> shift) AND 0xFF                                                                                                                                                              
+              local_hist[tid][b] ← local_hist[tid][b] + 1                                                                                                                                                 
+          // implicit barrier                                                                                                                                                                             
+                                                                                                                                                                                                          
+          // ── Phase 2 : single-thread block ──                                                                                                                                                          
+          executed by exactly one thread:
+              for b ← 0 to 255:                                                                                                                                                                           
+                  total[b] ← Σ_t local_hist[t][b]                                                                                                                                                         
+              gstart[0] ← 0
+              for b ← 1 to 255:                                                                                                                                                                           
+                  gstart[b] ← gstart[b-1] + total[b-1]
+              for b ← 0 to 255:                                                                                                                                                                           
+                  pos ← gstart[b]
+                  for t ← 0 to T-1:                                                                                                                                                                       
+                      offsets[t][b] ← pos
+                      pos ← pos + local_hist[t][b]                                                                                                                                                        
+          // implicit barrier
+                                                                                                                                                                                                          
+          // ── Phase 3 : parallel-for, SAME static partition as Phase 1 ──                                                                                                                               
+          for i ← 0 to n-1   distributed by static schedule:
+              b ← (src[i] >> shift) AND 0xFF                                                                                                                                                              
+              dst[offsets[tid][b]] ← src[i]                                                                                                                                                               
+              offsets[tid][b] ← offsets[tid][b] + 1
+          // implicit barrier                                                                                                                                                                             
+                                                                                                                                                                                                          
+  Style 3 — Block-diagram
+                                                                                                                                                                                                          
+          ┌────────────────────────────────────────────────┐
+          │   PASS p ∈ {0,1,2,3}     shift = p * 8         │
+          │   #pragma omp parallel num_threads(T)          │                                                                                                                                              
+          └────────────────────────────────────────────────┘
+                                  │                                                                                                                                                                       
+                FORK ─── { thread 0, 1, …, T-1 } ───
+                                  │                                                                                                                                                                       
+  PHASE 1 — #pragma omp for schedule(static)
+     ┌──────────┬──────────┬──────────┬──────────┐                                                                                                                                                        
+     │ chunk 0  │ chunk 1  │   ...    │ chunk T-1│   OpenMP partitions [0,n)
+     │  →hist[0]│  →hist[1]│          │ →hist[T-1]│                                                                                                                                                       
+     └──────────┴──────────┴──────────┴──────────┘                                                                                                                                                        
+  ══════════════ implicit BARRIER ═══════════════                                                                                                                                                         
+                                                                                                                                                                                                          
+  PHASE 2 — #pragma omp single   (one thread runs, others wait)                                                                                                                                           
+     sum histograms → exclusive prefix-scan → per-thread offsets[t][b]                                                                                                                                    
+  ══════════════ implicit BARRIER ═══════════════                                                                                                                                                         
+                  
+  PHASE 3 — #pragma omp for schedule(static)   ← SAME partition as Phase 1                                                                                                                                
+     ┌──────────┬──────────┬──────────┬──────────┐
+     │ chunk 0  │ chunk 1  │   ...    │ chunk T-1│                                                                                                                                                        
+     │ scatter  │ scatter  │          │ scatter  │                                                                                                                                                        
+     │  via     │  via     │          │  via     │
+     │offsets[0]│offsets[1]│          │offsets[T-1]│                                                                                                                                                      
+     └──────────┴──────────┴──────────┴──────────┘
+  ══════════════ implicit BARRIER ═══════════════                                                                                                                                                         
+                                  │
+                JOIN ─── back to main thread ───                                                                                                                                                          
+                                  │                                                                                                                                                                       
+         host swaps src/dst, loops to next pass
+                                                                                                                                                                                                          
+  ---             
+  4. CUDA GPU — gpu_radix_sort_pc.cu                                                                                                                                                                      
+                                                                                                                                                                                                          
+  Style 1 — High-level / English
+                                                                                                                                                                                                          
+  Same radix idea, but tuned for the GPU: 8 smaller passes of 4 bits each, giving only 16 buckets. Why 16? Because that small a histogram fits in fast on-chip shared memory.                             
+  
+  Setup:                                                                                                                                                                                                  
+  - Copy input from CPU memory to GPU memory once (host → device transfer).
+  - Allocate two device buffers ("ping-pong") and a histogram table.                                                                                                                                      
+                                                                    
+  Then for each of the 8 passes:
+  - Split the array into tiles of 2048 elements. Each GPU block owns one tile.                                                                                                                            
+  - Kernel 1 (histogram): every block builds a 16-bucket histogram of its tile in shared memory using atomic increments, then writes its 16 counts into a global table laid out as [bucket][block]        
+  (column-major) so prefix-sum across blocks is contiguous.                                                                                                                                               
+  - Kernel 2 (global scan): a single thread does an exclusive prefix-sum over the whole 16 × num_blocks table, turning counts into starting positions.                                                    
+  - Kernel 3 (scatter): thread 0 of each block walks its 2048 elements in order to assign each element a per-bucket "rank" — this preserves stability (essential for LSD correctness). Then all 256 
+  threads of the block write the elements to their final positions in parallel.                                                                                                                           
+                                                                                                                                                                                                          
+  After 8 passes (even number of swaps), copy the result back from GPU to CPU (device → host transfer).                                                                                                   
+                                                                                                                                                                                                          
+  Style 2 — Algorithmic / textbook
+                                                                                                                                                                                                          
+  GPU-RADIX-SORT(h_in, n):
+      num_blocks ← ⌈n / 2048⌉                                                                                                                                                                             
+      hist_size  ← 16 * num_blocks                                                                                                                                                                        
+                                                                                                                                                                                                          
+      allocate d_a, d_b, d_hist on device                                                                                                                                                                 
+      copy h_in → d_a                          // H2D transfer                                                                                                                                            
+                                                                                                                                                                                                          
+      src ← d_a;  dst ← d_b
+      for pass ← 0 to 7:                                                                                                                                                                                  
+          shift ← pass * 4                                                                                                                                                                                
+          zero d_hist
+          launch BLOCK-HIST  ⟨num_blocks, 256⟩ (src, d_hist, n, shift)                                                                                                                                    
+          launch GLOBAL-SCAN ⟨1, 1⟩            (d_hist, hist_size)                                                                                                                                        
+          launch SCATTER     ⟨num_blocks, 256⟩ (src, dst, d_hist, n, shift)                                                                                                                               
+          swap(src, dst)                                                                                                                                                                                  
+                                                                                                                                                                                                          
+      copy src → h_out                         // D2H transfer                                                                                                                                            
+                  
+  KERNEL BLOCK-HIST(in, block_hist, n, shift):                                                                                                                                                            
+      // grid: num_blocks  ·  block: 256 threads
+      shared lhist[0..15] ← 0                                                                                                                                                                             
+      SYNC                                                                                                                                                                                                
+                                                                                                                                                                                                          
+      bid ← blockIdx;  tid ← threadIdx                                                                                                                                                                    
+      base ← bid * 2048                                                                                                                                                                                   
+      for i ← tid to 2047 step 256:                                                                                                                                                                       
+          if base + i < n:
+              b ← (in[base + i] >> shift) AND 0xF                                                                                                                                                         
+              atomic lhist[b] ← lhist[b] + 1                                                                                                                                                              
+      SYNC                                                                                                                                                                                                
+                                                                                                                                                                                                          
+      if tid < 16:                                                                                                                                                                                        
+          block_hist[tid * num_blocks + bid] ← lhist[tid]
+                                                                                                                                                                                                          
+  KERNEL GLOBAL-SCAN(hist, total):
+      // grid: 1  ·  block: 1 thread  (single sequential exclusive scan)                                                                                                                                  
+      sum ← 0                                                                                                                                                                                             
+      for i ← 0 to total-1:                                                                                                                                                                               
+          v ← hist[i]                                                                                                                                                                                     
+          hist[i] ← sum                                                                                                                                                                                   
+          sum ← sum + v                                                                                                                                                                                   
+  
+  KERNEL SCATTER(in, out, prefix, n, shift):                                                                                                                                                              
+      // grid: num_blocks  ·  block: 256 threads
+      shared s_goff[0..15]
+      shared s_rank[0..2047]                                                                                                                                                                              
+                                                                                                                                                                                                          
+      bid ← blockIdx;  tid ← threadIdx                                                                                                                                                                    
+      if tid < 16:                                                                                                                                                                                        
+          s_goff[tid] ← prefix[tid * num_blocks + bid]
+      SYNC                                                                                                                                                                                                
+  
+      // thread 0 only — sequential rank assignment for stability                                                                                                                                         
+      if tid = 0: 
+          cnt[0..15] ← 0                                                                                                                                                                                  
+          for i ← 0 to 2047:                                                                                                                                                                              
+              if bid * 2048 + i < n:
+                  b ← (in[bid * 2048 + i] >> shift) AND 0xF                                                                                                                                               
+                  s_rank[i] ← cnt[b]
+                  cnt[b] ← cnt[b] + 1                                                                                                                                                                     
+      SYNC        
+                                                                                                                                                                                                          
+      // all threads — parallel write
+      base ← bid * 2048
+      for i ← tid to 2047 step 256:                                                                                                                                                                       
+          gi ← base + i
+          if gi < n:                                                                                                                                                                                      
+              v ← in[gi]
+              b ← (v >> shift) AND 0xF
+              out[s_goff[b] + s_rank[i]] ← v                                                                                                                                                              
+
+  Style 3 — Block-diagram
+
+  HOST (CPU)
+     │
+     │  cudaMemcpy   h_in ──────────────────────► d_a       (H2D transfer)
+     ▼
+  ═══════════════════════════════════════════════════════════════════════
+  DEVICE (GPU)   ·   PASS p ∈ {0..7}   ·   shift = p * 4
+  ═══════════════════════════════════════════════════════════════════════
+
+  [Kernel 1] BLOCK-HIST   <<< num_blocks , 256 threads >>>
+     ┌──────────┬──────────┬──────────┬──────────┐
+     │ Block 0  │ Block 1  │   ...    │ Block B-1│   each owns 2048-elem tile
+     │ build    │ build    │          │ build    │
+     │ shared   │ shared   │          │ shared   │
+     │lhist[16] │lhist[16] │          │lhist[16] │   ← atomicAdd in shared mem
+     │   ↓      │   ↓      │          │   ↓      │
+     │ write 16 │ write 16 │          │ write 16 │
+     │ counts   │ counts   │          │ counts   │
+     │  → col   │  → col   │          │  → col   │
+     │block_hist│block_hist│          │block_hist│   layout: [bin][block]
+     └──────────┴──────────┴──────────┴──────────┘
+  ══════════════ GLOBAL SYNC (kernel boundary) ═══════════════
+
+  [Kernel 2] GLOBAL-SCAN   <<< 1 block , 1 thread >>>
+     exclusive prefix-sum over the 16 × num_blocks table
+     →  hist[i] now = global write offset for that (bin, block)
+  ══════════════ GLOBAL SYNC (kernel boundary) ═══════════════
+
+  [Kernel 3] SCATTER   <<< num_blocks , 256 threads >>>
+     ┌──────────────────────────────────────────────────────┐
+     │ Each block:                                          │
+     │   • all threads load s_goff[bin] from global prefix  │
+     │     ─── SYNC ───                                     │
+     │   • thread 0 scans its tile, assigns s_rank[i]       │
+     │     (stable: in-tile order preserved)                │
+     │     ─── SYNC ───                                     │
+     │   • all 256 threads write in parallel:               │
+     │       out[s_goff[bin] + s_rank[i]] ← in[i]           │
+     └──────────────────────────────────────────────────────┘
+  ══════════════ GLOBAL SYNC (kernel boundary) ═══════════════
+
+     swap(src, dst) on host  →  next pass
+                            │
+                            ▼
+                after 8 passes (even):
+     cudaMemcpy   d_a ──────────────────────► h_out        (D2H transfer)
+
+  ---
