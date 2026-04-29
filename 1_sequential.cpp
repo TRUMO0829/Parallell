@@ -63,17 +63,40 @@ bool is_sorted_check(const std::vector<uint32_t> &v) {
   return true;
 }
 
+// LSD radix-sort op model (shared across all 4 implementations):
+//   PASSES * (4 * N + B)
+//     - histogram (1 op/elem)  + scatter (3 ops/elem: read, shift+mask, write)
+//     - prefix-sum cost B per pass
+// Use the same constant in every impl so SpeedUp / MOPS comparisons are apples-to-apples.
+static constexpr int RADIX_PASSES = 4;     // base-256 over 32-bit keys
+static constexpr int RADIX_B      = 256;
+
+static long long radix_total_ops(std::size_t n) {
+  return static_cast<long long>(RADIX_PASSES) * (4LL * static_cast<long long>(n) + RADIX_B);
+}
+
 struct Result {
   std::size_t n;
-  double time_ms;
-  double throughput_meps;
-  bool correct;
+  int         threads;       // = 1 for sequential
+  double      execution_ms;  // wall-clock around the sort call
+  double      computation_ms;// pure compute (= execution_ms on CPU)
+  double      transfer_ms;   // host<->device transfer (= 0 on CPU)
+  long long   transfer_bytes;// 0 on CPU (no PCIe transfer)
+  long long   total_ops;
+  double      performance_mops;
+  bool        correct;
 };
 
 Result benchmark(std::size_t n, int runs = 20) {
   std::vector<double> times;
   times.reserve(runs);
   bool ok = true;
+
+  // warmup (untimed) — hot caches and allocator
+  {
+    auto data = random_data(n, /*seed=*/0);
+    radix_sort(data);
+  }
 
   for (int r = 0; r < runs; ++r) {
     auto data = random_data(n, /*seed=*/r * 1337 + 7);
@@ -88,49 +111,71 @@ Result benchmark(std::size_t n, int runs = 20) {
   }
 
   std::sort(times.begin(), times.end());
-  double median_ms = times[runs / 2];   // use median, not mean
-  double meps = (static_cast<double>(n) / 1e6) / (median_ms / 1000.0);
+  double median_ms = times[runs / 2];
 
-  return {n, median_ms, meps, ok};
+  Result res;
+  res.n                = n;
+  res.threads          = 1;
+  res.execution_ms     = median_ms;
+  res.computation_ms   = median_ms;   // no host/device split on CPU
+  res.transfer_ms      = 0.0;
+  res.transfer_bytes   = 0;
+  res.total_ops        = radix_total_ops(n);
+  res.performance_mops = static_cast<double>(res.total_ops) / (median_ms * 1000.0);
+  res.correct          = ok;
+  return res;
 }
 
 int main() {
-  const std::vector<std::size_t> sizes = {10'000, 100'000, 1'000'000};
+  const std::vector<std::size_t> sizes = {10'000, 100'000, 1'000'000, 10'000'000};
   const int RUNS = 20;
 
   std::vector<Result> results;
   results.reserve(sizes.size());
 
   std::cout << "\n  Sequential LSD Radix Sort (Base-256, uint32_t)\n";
-  std::cout << "  " << std::string(56, '-') << "\n";
-  std::cout << std::setw(12) << "Elements" << std::setw(16) << "Avg time (ms)"
-            << std::setw(20) << "Throughput (M el/s)" << std::setw(10)
-            << "Correct"
+  std::cout << "  " << std::string(72, '-') << "\n";
+  std::cout << std::setw(12) << "Elements"
+            << std::setw(14) << "Exec (ms)"
+            << std::setw(14) << "Compute (ms)"
+            << std::setw(14) << "Xfer (ms)"
+            << std::setw(14) << "Perf (MOPS)"
+            << std::setw(10) << "Correct"
             << "\n";
-  std::cout << "  " << std::string(56, '-') << "\n";
+  std::cout << "  " << std::string(72, '-') << "\n";
 
   for (auto n : sizes) {
     auto r = benchmark(n, RUNS);
     results.push_back(r);
-    std::cout << std::setw(12) << r.n << std::setw(16) << std::fixed
-              << std::setprecision(3) << r.time_ms << std::setw(20)
-              << std::fixed << std::setprecision(2) << r.throughput_meps
+    std::cout << std::setw(12) << r.n
+              << std::setw(14) << std::fixed << std::setprecision(3) << r.execution_ms
+              << std::setw(14) << std::fixed << std::setprecision(3) << r.computation_ms
+              << std::setw(14) << std::fixed << std::setprecision(3) << r.transfer_ms
+              << std::setw(14) << std::fixed << std::setprecision(2) << r.performance_mops
               << std::setw(10) << (r.correct ? "YES" : "NO!") << "\n";
   }
-  std::cout << "  " << std::string(56, '-') << "\n\n";
-  std::cout << "  (each result averaged over " << RUNS << " runs)\n\n";
+  std::cout << "  " << std::string(72, '-') << "\n\n";
+  std::cout << "  (each result is median of " << RUNS << " runs)\n\n";
 
-  // ── Write CSV ──────────────────────────────
+  // ── Write CSV (unified schema across all 4 impls) ───────────────────────
+  // implementation,N,threads,execution_ms,computation_ms,transfer_ms,
+  // transfer_bytes,total_ops,performance_mops,sorted_ok
   const std::string csv_path = "radix_sort_stats.csv";
   std::ofstream csv(csv_path);
   if (!csv) {
     std::cerr << "Could not open " << csv_path << " for writing.\n";
     return 1;
   }
-  csv << "elements,avg_time_ms,throughput_meps,correct\n";
+  csv << "implementation,N,threads,execution_ms,computation_ms,transfer_ms,"
+         "transfer_bytes,total_ops,performance_mops,sorted_ok\n";
   for (auto &r : results)
-    csv << r.n << "," << std::fixed << std::setprecision(4) << r.time_ms << ","
-        << std::fixed << std::setprecision(4) << r.throughput_meps << ","
+    csv << "sequential," << r.n << "," << r.threads << ","
+        << std::fixed << std::setprecision(4) << r.execution_ms << ","
+        << std::fixed << std::setprecision(4) << r.computation_ms << ","
+        << std::fixed << std::setprecision(4) << r.transfer_ms << ","
+        << r.transfer_bytes << ","
+        << r.total_ops << ","
+        << std::fixed << std::setprecision(4) << r.performance_mops << ","
         << (r.correct ? "true" : "false") << "\n";
   csv.close();
   std::cout << "  Stats written to radix_sort_stats.csv\n\n";

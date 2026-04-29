@@ -202,23 +202,38 @@
  // ════════════════════════════════════════════════════════════════════════════
  //  Benchmark
  // ════════════════════════════════════════════════════════════════════════════
+ // Op model shared with all 4 impls: PASSES * (4*N + B)
+ static long long radix_total_ops(std::size_t n) {
+     return static_cast<long long>(PASSES) * (4LL * static_cast<long long>(n) + B);
+ }
+
  struct Result {
      std::size_t n;
      int         threads;
-     double      time_ms;
-     double      throughput_meps;
+     double      execution_ms;
+     double      computation_ms;
+     double      transfer_ms;
+     long long   transfer_bytes;
+     long long   total_ops;
+     double      performance_mops;
      bool        correct;
  };
- 
+
  static Result benchmark(std::size_t n, int T, int runs = 20)
  {
      std::vector<double> times;
      times.reserve(runs);
      bool ok = true;
 
+     // warmup (untimed)
+     {
+         auto data = random_data(n, 0u);
+         radix_sort_omp(data, T);
+     }
+
      for (int r = 0; r < runs; ++r) {
          auto data = random_data(n, r * 1337u + 7u);
-         double t0 = omp_get_wtime();          // OpenMP's own timer [omp guide]
+         double t0 = omp_get_wtime();
          radix_sort_omp(data, T);
          double t1 = omp_get_wtime();
 
@@ -227,9 +242,19 @@
      }
 
      std::sort(times.begin(), times.end());
-     double median_ms = times[runs / 2];   // use median, not mean
-     double meps      = (static_cast<double>(n) / 1e6) / (median_ms / 1e3);
-     return {n, T, median_ms, meps, ok};
+     double median_ms = times[runs / 2];
+
+     Result res;
+     res.n                = n;
+     res.threads          = T;
+     res.execution_ms     = median_ms;
+     res.computation_ms   = median_ms;   // CPU: no host/device split
+     res.transfer_ms      = 0.0;
+     res.transfer_bytes   = 0;
+     res.total_ops        = radix_total_ops(n);
+     res.performance_mops = static_cast<double>(res.total_ops) / (median_ms * 1000.0);
+     res.correct          = ok;
+     return res;
  }
  
  // ════════════════════════════════════════════════════════════════════════════
@@ -237,57 +262,65 @@
  // ════════════════════════════════════════════════════════════════════════════
  int main()
  {
-     const std::vector<std::size_t> sizes   = {10'000, 100'000, 1'000'000};
+     const std::vector<std::size_t> sizes   = {10'000, 100'000, 1'000'000, 10'000'000};
      const std::vector<int>         threads = {1, 2, 4, 8, 16};
      const int RUNS = 20;
  
      // Report available hardware threads
      std::cout << "\n  Host logical CPUs : " << omp_get_max_threads() << "\n";
      std::cout << "\n  Parallel LSD Radix Sort (Base-256, OpenMP, uint32_t)\n";
-     std::cout << "  " << std::string(70, '-') << "\n";
+     std::cout << "  " << std::string(78, '-') << "\n";
      std::cout << std::setw(12) << "Elements"
                << std::setw(10) << "Threads"
-               << std::setw(18) << "Avg time (ms)"
-               << std::setw(22) << "Throughput (M el/s)"
+               << std::setw(14) << "Exec (ms)"
+               << std::setw(14) << "Compute (ms)"
+               << std::setw(14) << "Xfer (ms)"
+               << std::setw(14) << "Perf (MOPS)"
                << std::setw(10) << "Correct"
                << "\n";
-     std::cout << "  " << std::string(70, '-') << "\n";
- 
+     std::cout << "  " << std::string(78, '-') << "\n";
+
      std::vector<Result> all_results;
- 
+
      for (auto n : sizes) {
          bool first_row = true;
          for (auto T : threads) {
              auto r = benchmark(n, T, RUNS);
              all_results.push_back(r);
- 
+
              std::cout << std::setw(12) << (first_row ? std::to_string(r.n) : "")
                        << std::setw(10) << r.threads
-                       << std::setw(18) << std::fixed << std::setprecision(3) << r.time_ms
-                       << std::setw(22) << std::fixed << std::setprecision(2) << r.throughput_meps
+                       << std::setw(14) << std::fixed << std::setprecision(3) << r.execution_ms
+                       << std::setw(14) << std::fixed << std::setprecision(3) << r.computation_ms
+                       << std::setw(14) << std::fixed << std::setprecision(3) << r.transfer_ms
+                       << std::setw(14) << std::fixed << std::setprecision(2) << r.performance_mops
                        << std::setw(10) << (r.correct ? "YES" : "NO!")
                        << "\n";
              first_row = false;
          }
-         std::cout << "  " << std::string(70, '-') << "\n";
+         std::cout << "  " << std::string(78, '-') << "\n";
      }
- 
-     std::cout << "\n  (each result averaged over " << RUNS << " runs)\n\n";
- 
-     // ── Write CSV ─────────────────────────────────────────────────────────
+
+     std::cout << "\n  (each result is median of " << RUNS << " runs)\n\n";
+
+     // ── Write CSV (unified schema) ────────────────────────────────────────
      const std::string csv_path = "radix_sort_omp_stats.csv";
      std::ofstream csv(csv_path);
      if (!csv) { std::cerr << "Cannot open CSV.\n"; return 1; }
- 
-     csv << "elements,threads,avg_time_ms,throughput_meps,correct\n";
+
+     csv << "implementation,N,threads,execution_ms,computation_ms,transfer_ms,"
+            "transfer_bytes,total_ops,performance_mops,sorted_ok\n";
      for (auto& r : all_results)
-         csv << r.n       << ","
-             << r.threads << ","
-             << std::fixed << std::setprecision(4) << r.time_ms << ","
-             << std::fixed << std::setprecision(4) << r.throughput_meps << ","
+         csv << "openmp," << r.n << "," << r.threads << ","
+             << std::fixed << std::setprecision(4) << r.execution_ms << ","
+             << std::fixed << std::setprecision(4) << r.computation_ms << ","
+             << std::fixed << std::setprecision(4) << r.transfer_ms << ","
+             << r.transfer_bytes << ","
+             << r.total_ops << ","
+             << std::fixed << std::setprecision(4) << r.performance_mops << ","
              << (r.correct ? "true" : "false") << "\n";
      csv.close();
- 
+
      std::cout << "  Stats written to radix_sort_omp_stats.csv\n\n";
      return 0;
  }
