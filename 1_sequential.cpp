@@ -1,5 +1,9 @@
- // g++ -O2 -std=c++17 -pthread 1_sequential.cpp -o 1_sequential
+// g++ -O2 -std=c++17 -pthread 1_sequential.cpp -o 1_sequential
 // ./1_sequential
+//
+// Sequential LSD radix sort: 4 passes over 8-bit digits of uint32 keys.
+// Single-threaded baseline used as the reference for speedup of the
+// pthread / OpenMP / CUDA versions.
 
 #include <algorithm>
 #include <chrono>
@@ -12,28 +16,34 @@
 #include <string>
 #include <vector>
 
+// One LSD pass: count -> prefix-sum -> scatter, on the byte at `shift`.
 static void counting_sort_pass(const std::vector<uint32_t> &in,
                                std::vector<uint32_t> &out,
-                               int shift) 
+                               int shift)
 {
-  constexpr int B = 256; 
+  constexpr int B = 256;            // one bucket per byte value (0..255)
   std::size_t n = in.size();
 
+  // Phase 1 — Histogram: count elements per bucket.
   uint32_t count[B] = {};
   for (std::size_t i = 0; i < n; ++i)
     ++count[(in[i] >> shift) & 0xFF];
 
+  // Phase 2 — Exclusive prefix-sum: starting position of each bucket in output.
   uint32_t prefix[B];
   prefix[0] = 0;
   for (int k = 1; k < B; ++k)
     prefix[k] = prefix[k - 1] + count[k - 1];
 
+  // Phase 3 — Scatter: place each element at its bucket position (stable).
   for (std::size_t i = 0; i < n; ++i) {
     int bucket = (in[i] >> shift) & 0xFF;
     out[prefix[bucket]++] = in[i];
   }
 }
 
+// Full sort: 4 passes over each byte (LSD-first); buffers alternate.
+// Even number of passes -> result lands back in `data`.
 void radix_sort(std::vector<uint32_t> &data) {
   std::size_t n = data.size();
   if (n < 2)
@@ -47,6 +57,7 @@ void radix_sort(std::vector<uint32_t> &data) {
   counting_sort_pass(tmp, data, 24);
 }
 
+// Test data: deterministic uniform random uint32 values from a given seed.
 std::vector<uint32_t> random_data(std::size_t n, uint32_t seed = 42) {
   std::mt19937 rng(seed);
   std::uniform_int_distribution<uint32_t> dist(0, UINT32_MAX);
@@ -56,6 +67,7 @@ std::vector<uint32_t> random_data(std::size_t n, uint32_t seed = 42) {
   return v;
 }
 
+// Correctness check: verify the array is non-decreasing.
 bool is_sorted_check(const std::vector<uint32_t> &v) {
   for (std::size_t i = 1; i < v.size(); ++i)
     if (v[i] < v[i - 1])
@@ -63,43 +75,44 @@ bool is_sorted_check(const std::vector<uint32_t> &v) {
   return true;
 }
 
-// LSD radix-sort op model (shared across all 4 implementations):
-//   PASSES * (4 * N + B)
-//     - histogram (1 op/elem)  + scatter (3 ops/elem: read, shift+mask, write)
-//     - prefix-sum cost B per pass
-// Use the same constant in every impl so SpeedUp / MOPS comparisons are apples-to-apples.
-static constexpr int RADIX_PASSES = 4;     // base-256 over 32-bit keys
+// Op-count model shared across all 4 implementations:
+//   PASSES * (4N + B)  =  count(1) + scatter(3) per element + prefix-sum(B) per pass
+// Used to derive a unified MOPS metric for fair comparison.
+static constexpr int RADIX_PASSES = 4;
 static constexpr int RADIX_B      = 256;
 
 static long long radix_total_ops(std::size_t n) {
   return static_cast<long long>(RADIX_PASSES) * (4LL * static_cast<long long>(n) + RADIX_B);
 }
 
+// Per-run benchmark output (unified CSV schema across all impls).
 struct Result {
   std::size_t n;
-  int         threads;       // = 1 for sequential
-  double      execution_ms;  // wall-clock around the sort call
-  double      computation_ms;// pure compute (= execution_ms on CPU)
-  double      transfer_ms;   // host<->device transfer (= 0 on CPU)
-  long long   transfer_bytes;// 0 on CPU (no PCIe transfer)
+  int         threads;
+  double      execution_ms;
+  double      computation_ms;
+  double      transfer_ms;
+  long long   transfer_bytes;
   long long   total_ops;
   double      performance_mops;
   bool        correct;
 };
 
+// Run `runs` timed trials with fresh data per run, return median time.
+// One untimed warmup primes caches and the allocator.
 Result benchmark(std::size_t n, int runs = 20) {
   std::vector<double> times;
   times.reserve(runs);
   bool ok = true;
 
-  // warmup (untimed) — hot caches and allocator
+  // Warmup (untimed): hot caches, allocator pre-warmed.
   {
-    auto data = random_data(n, /*seed=*/0);
+    auto data = random_data(n, 0);
     radix_sort(data);
   }
 
   for (int r = 0; r < runs; ++r) {
-    auto data = random_data(n, /*seed=*/r * 1337 + 7);
+    auto data = random_data(n, r * 1337 + 7);   // fresh data per run
 
     auto t0 = std::chrono::high_resolution_clock::now();
     radix_sort(data);
@@ -117,7 +130,7 @@ Result benchmark(std::size_t n, int runs = 20) {
   res.n                = n;
   res.threads          = 1;
   res.execution_ms     = median_ms;
-  res.computation_ms   = median_ms;   // no host/device split on CPU
+  res.computation_ms   = median_ms;       // CPU: no host/device split
   res.transfer_ms      = 0.0;
   res.transfer_bytes   = 0;
   res.total_ops        = radix_total_ops(n);
@@ -127,6 +140,7 @@ Result benchmark(std::size_t n, int runs = 20) {
 }
 
 int main() {
+  // Sweep over four problem sizes; print table and write CSV.
   const std::vector<std::size_t> sizes = {10'000, 100'000, 1'000'000, 10'000'000};
   const int RUNS = 20;
 
@@ -157,9 +171,7 @@ int main() {
   std::cout << "  " << std::string(72, '-') << "\n\n";
   std::cout << "  (each result is median of " << RUNS << " runs)\n\n";
 
-  // ── Write CSV (unified schema across all 4 impls) ───────────────────────
-  // implementation,N,threads,execution_ms,computation_ms,transfer_ms,
-  // transfer_bytes,total_ops,performance_mops,sorted_ok
+  // Write CSV using the unified schema shared with all 4 implementations.
   const std::string csv_path = "radix_sort_stats.csv";
   std::ofstream csv(csv_path);
   if (!csv) {
