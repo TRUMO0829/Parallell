@@ -1,5 +1,5 @@
-implementation,N,median_exec_ms,median_compute_ms,median_transfer_ms,transfer_bytes,performance_mops,sorted_ok
-cuda_pc,10000,0.6645,0.6394,0.0240,80000,279.19,true
-cuda_pc,100000,0.7922,0.7070,0.0807,800000,1597.51,true
-cuda_pc,1000000,1.9206,1.4744,0.4465,8000000,6282.09,true
-cuda_pc,10000000,18.7405,14.9417,3.7975,80000000,6406.74,true
+implementation,N,execution_ms,computation_ms,transfer_ms,transfer_bytes,performance_mops
+cuda,10000,1.303,1.280,0.013,81920,126
+cuda,100000,1.524,1.436,0.065,819200,1115
+cuda,1000000,2.945,2.503,0.398,8388608,6394
+cuda,10000000,18.151,14.079,4.005,83886080,11364
