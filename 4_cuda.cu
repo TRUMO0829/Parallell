@@ -1,47 +1,6 @@
-// 4_cuda.cu
-// ─────────────────────────────────────────────────────────────────────────────
-// Build (RTX 5080 = Blackwell, sm_120, requires CUDA 12.8 or newer):
 //   nvcc -O3 -std=c++17 -arch=sm_120 4_cuda.cu -o 4_cuda
-// Run:
 //   ./4_cuda
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Path B: from-scratch GPU LSD radix sort, base-256, uint32_t.
-// Mirrors the 3-phase structure of 2_pthread.cpp / 3_openmp.cpp.
-//
-// Mapping (CPU → GPU):
-//   pthread "T threads, each owning a chunk"   →  GPU "G blocks, each owning a chunk"
-//   pthread phase 1 (per-thread local hist)    →  histogram_kernel
-//   pthread phase 2 (thread-0 serial scan)     →  cub::DeviceScan::ExclusiveSum
-//   pthread phase 3 (per-thread scatter)       →  scatter_kernel (1 thread/block, stable)
-//
-// Per pass (4 passes total = 4 × 8 bits = 32 bits):
-//   Phase 1 — histogram_kernel<<<G, 256>>>
-//     All 256 threads of each block cooperate via shared-memory atomicAdd to
-//     build ONE 256-bucket histogram for the block's chunk. Result is written
-//     out in BUCKET-MAJOR layout: g_hist[bucket * G + bid]. Bucket-major lets
-//     us run a single linear ExclusiveSum to get every offset we need.
-//
-//   Phase 2 — cub::DeviceScan::ExclusiveSum  (parallel, in-place)
-//     After scan, g_hist[bucket * G + bid] = the global write start where
-//     block `bid` should begin writing elements of `bucket` to dst.
-//     This is the exact analog of pthread phase 2 — thread 0's serial scan.
-//
-//   Phase 3 — scatter_kernel<<<G, 1>>>
-//     One thread per block walks its chunk in source order, post-incrementing
-//     the per-bucket offset. Post-increment preserves stability inside the
-//     block; because each block writes to a disjoint range of dst per bucket,
-//     stability holds across blocks too. No atomics needed.
-//
-//   Buffer swap; repeat. After 4 swaps (even), result is back in d_keys.
-//
-// Tradeoff being made for code clarity:
-//   • The scatter uses 1 thread per block. Hardware schedules each block as a
-//     single-lane warp, leaving 31/32 lanes idle in scatter. That's the price
-//     for the cleanest stable scatter. With G ≈ N / 8192 blocks all running
-//     concurrently, you still get massive parallelism — for N=10M, G≈1280.
-//   • For optimal scatter you need warp-cooperative multisplit (CUB / Onesweep)
-//     which is a much bigger lift and outside the scope of Path B.
+
 
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
@@ -57,17 +16,11 @@
 #include <string>
 #include <vector>
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Tunables
-// ═══════════════════════════════════════════════════════════════════════════
 static constexpr int NUM_BUCKETS        = 256;    // base-256
 static constexpr int PASSES             = 4;      // 4 × 8 bits = 32 bits
 static constexpr int HIST_BLOCK_THREADS = 256;    // threads/block in histogram
 static constexpr int ITEMS_PER_BLOCK    = 8192;   // chunk size per block
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  CUDA error check
-// ═══════════════════════════════════════════════════════════════════════════
 #define CUDA_CHECK(call)                                                        \
     do {                                                                        \
         cudaError_t err__ = (call);                                             \
@@ -78,9 +31,7 @@ static constexpr int ITEMS_PER_BLOCK    = 8192;   // chunk size per block
         }                                                                       \
     } while (0)
 
-// ═══════════════════════════════════════════════════════════════════════════
 //  Phase 1 — block-level histogram
-// ═══════════════════════════════════════════════════════════════════════════
 __global__ void histogram_kernel(const uint32_t* __restrict__ src,
                                   uint32_t* __restrict__ g_hist,
                                   int n, int shift, int num_blocks)
@@ -112,9 +63,7 @@ __global__ void histogram_kernel(const uint32_t* __restrict__ src,
         g_hist[tid * num_blocks + bid] = s_hist[tid];
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 //  Phase 3 — block-level scatter (1 thread per block, stable)
-// ═══════════════════════════════════════════════════════════════════════════
 __global__ void scatter_kernel(const uint32_t* __restrict__ src,
                                 uint32_t* __restrict__ dst,
                                 const uint32_t* __restrict__ g_offsets,
@@ -140,9 +89,7 @@ __global__ void scatter_kernel(const uint32_t* __restrict__ src,
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 //  Device-side state + sort orchestration
-// ═══════════════════════════════════════════════════════════════════════════
 struct GpuSortBuffers {
     uint32_t* d_keys         = nullptr;
     uint32_t* d_buf          = nullptr;
@@ -211,9 +158,7 @@ static void radix_sort_gpu(GpuSortBuffers& b)
     // 4 swaps (even) → src ends back at b.d_keys → result is in d_keys ✓
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 //  Helpers
-// ═══════════════════════════════════════════════════════════════════════════
 static std::vector<uint32_t> random_data(std::size_t n, uint32_t seed = 42)
 {
     std::mt19937 rng(seed);
