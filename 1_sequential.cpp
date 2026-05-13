@@ -12,34 +12,28 @@
 #include <string>
 #include <vector>
 
-// Нэг LSD алхам: тоолох -> урьдчилсан нийлбэр -> тараах (`shift` орон дээр).
 static void counting_sort_pass(const std::vector<uint32_t> &in,
                                std::vector<uint32_t> &out,
                                int shift)
 {
-  constexpr int B = 256;            // байт тус бүрд нэг хувин (0..255)
+  constexpr int B = 256;        
   std::size_t n = in.size();
 
-  // Үе 1 — Гистограм: хувин бүрт оногдох элементийн тоог тоолно.
   uint32_t count[B] = {};
   for (std::size_t i = 0; i < n; ++i)
     ++count[(in[i] >> shift) & 0xFF];
 
-  // Үе 2 — Exclusive prefix-sum: хувин бүрийн эхлэх индексийг тооцно.
   uint32_t prefix[B];
   prefix[0] = 0;
   for (int k = 1; k < B; ++k)
     prefix[k] = prefix[k - 1] + count[k - 1];
 
-  // Үе 3 — Тараах: элемент бүрийг өөрийн хувины байрлалд хадгална (тогтвортой).
   for (std::size_t i = 0; i < n; ++i) {
     int bucket = (in[i] >> shift) & 0xFF;
     out[prefix[bucket]++] = in[i];
   }
 }
 
-// Бүрэн цэгцлэлт: 4 байт тус бүрд алхам хийнэ; буферууд ээлжилнэ.
-// Тэгш тооны алхамын дараа (4) үр дүн `data`-д буцаж ирнэ.
 void radix_sort(std::vector<uint32_t> &data) {
   std::size_t n = data.size();
   if (n < 2)
@@ -53,7 +47,6 @@ void radix_sort(std::vector<uint32_t> &data) {
   counting_sort_pass(tmp, data, 24);
 }
 
-// Туршилтын өгөгдөл: seed-ээс хамаарсан жигд тархалттай uint32 утгууд.
 std::vector<uint32_t> random_data(std::size_t n, uint32_t seed = 42) {
   std::mt19937 rng(seed);
   std::uniform_int_distribution<uint32_t> dist(0, UINT32_MAX);
@@ -63,7 +56,6 @@ std::vector<uint32_t> random_data(std::size_t n, uint32_t seed = 42) {
   return v;
 }
 
-// Зөв эсэхийг шалгах: массив өсөх дарааллаар байгаа эсэх.
 bool is_sorted_check(const std::vector<uint32_t> &v) {
   for (std::size_t i = 1; i < v.size(); ++i)
     if (v[i] < v[i - 1])
@@ -71,9 +63,6 @@ bool is_sorted_check(const std::vector<uint32_t> &v) {
   return true;
 }
 
-// 4 хэрэгжүүлэлтэд адил үйлдлийн загвар:
-//   PASSES * (4N + B) = тоолох(1) + тараах(3) элемент тутамд + prefix-sum(B)
-// MOPS-ийн утгыг шударга харьцуулахад ашиглана.
 static constexpr int RADIX_PASSES = 4;
 static constexpr int RADIX_B      = 256;
 
@@ -81,7 +70,6 @@ static long long radix_total_ops(std::size_t n) {
   return static_cast<long long>(RADIX_PASSES) * (4LL * static_cast<long long>(n) + RADIX_B);
 }
 
-// Туршилтын үр дүнгийн бүтэц (бүх хэрэгжүүлэлтэд адил CSV форматтай).
 struct Result {
   std::size_t n;
   int         threads;
@@ -94,21 +82,18 @@ struct Result {
   bool        correct;
 };
 
-// `runs` удаа хэмжсэн дунд (median) хугацааг буцаана.
-// Эхэнд хугацаа хэмжихгүй 1 удаа warmup хийж кэшийг халаана.
 Result benchmark(std::size_t n, int runs = 20) {
   std::vector<double> times;
   times.reserve(runs);
   bool ok = true;
 
-  // Урьдчилсан халаалт: кэш ба allocator-ийг бэлтгэнэ.
   {
     auto data = random_data(n, 0);
     radix_sort(data);
   }
 
   for (int r = 0; r < runs; ++r) {
-    auto data = random_data(n, r * 1337 + 7);   // run бүрд шинэ өгөгдөл
+    auto data = random_data(n, r * 1337 + 7);  
 
     auto t0 = std::chrono::high_resolution_clock::now();
     radix_sort(data);
@@ -126,7 +111,7 @@ Result benchmark(std::size_t n, int runs = 20) {
   res.n                = n;
   res.threads          = 1;
   res.execution_ms     = median_ms;
-  res.computation_ms   = median_ms;       // CPU: host/device хуваагдалгүй
+  res.computation_ms   = median_ms;       
   res.transfer_ms      = 0.0;
   res.transfer_bytes   = 0;
   res.total_ops        = radix_total_ops(n);
@@ -136,7 +121,6 @@ Result benchmark(std::size_t n, int runs = 20) {
 }
 
 int main() {
-  // 4 өөр хэмжээ дээр давтан туршиж, хүснэгт хэвлэн CSV-д бичнэ.
   const std::vector<std::size_t> sizes = {10'000, 100'000, 1'000'000, 10'000'000};
   const int RUNS = 20;
 
@@ -164,9 +148,7 @@ int main() {
               << std::setw(10) << (r.correct ? "YES" : "NO!") << "\n";
   }
   std::cout << "  " << std::string(72, '-') << "\n\n";
-  // std::cout << "  (each result is median of " << RUNS << " runs)\n\n";
 
-  // Бүх 4 хэрэгжүүлэлтэд адил CSV форматаар үр дүнг бичнэ.
   const std::string csv_path = "radix_sort_stats.csv";
   std::ofstream csv(csv_path);
   if (!csv) {
